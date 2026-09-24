@@ -86,7 +86,7 @@ func TestBuildDeclaresProviderCapabilities(t *testing.T) {
 			t.Fatalf("menu route path = %q, want a /quota/ page", resource.Path)
 		}
 	}
-	for _, path := range []string{"/oauth/start", "/oauth/callback"} {
+	for _, path := range []string{"/oauth/start", "/oauth/authorize", "/oauth/callback"} {
 		if !paths[path] {
 			t.Fatalf("management registration is missing %s: %#v", path, registered.Resources)
 		}

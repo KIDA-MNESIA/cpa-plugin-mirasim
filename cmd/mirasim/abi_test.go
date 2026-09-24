@@ -168,7 +168,7 @@ func TestABIServesTheOAuthCallbackResource(t *testing.T) {
 			menuRoute = resource
 		}
 	}
-	for _, path := range []string{"/oauth/start", "/oauth/callback"} {
+	for _, path := range []string{"/oauth/start", "/oauth/authorize", "/oauth/callback"} {
 		if _, ok := paths[path]; !ok {
 			t.Fatalf("registration is missing %s: %#v", path, registration.Resources)
 		}
