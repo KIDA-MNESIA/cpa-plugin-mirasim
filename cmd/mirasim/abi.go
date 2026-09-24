@@ -177,7 +177,14 @@ type abiQuotaResetRequest struct {
 // handlers stay behind: the host dispatches every registered route back through
 // management.handle.
 type abiManagementRegistration struct {
-	Resources []abiResourceRoute `json:"resources,omitempty"`
+	Routes    []abiManagementRoute `json:"routes,omitempty"`
+	Resources []abiResourceRoute   `json:"resources,omitempty"`
+}
+
+type abiManagementRoute struct {
+	Method      string `json:"Method"`
+	Path        string `json:"Path"`
+	Description string `json:"Description,omitempty"`
 }
 
 type abiResourceRoute struct {
@@ -603,7 +610,15 @@ func currentPlugin() (*mirasimplugin.MirasimPlugin, error) {
 }
 
 func toABIManagementRegistration(resp pluginapi.ManagementRegistrationResponse) abiManagementRegistration {
-	out := abiManagementRegistration{Resources: make([]abiResourceRoute, 0, len(resp.Resources))}
+	out := abiManagementRegistration{
+		Routes:    make([]abiManagementRoute, 0, len(resp.Routes)),
+		Resources: make([]abiResourceRoute, 0, len(resp.Resources)),
+	}
+	for _, route := range resp.Routes {
+		out.Routes = append(out.Routes, abiManagementRoute{
+			Method: route.Method, Path: route.Path, Description: route.Description,
+		})
+	}
 	for _, resource := range resp.Resources {
 		out.Resources = append(out.Resources, abiResourceRoute{Path: resource.Path, Menu: resource.Menu, Description: resource.Description})
 	}

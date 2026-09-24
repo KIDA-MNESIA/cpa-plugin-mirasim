@@ -68,8 +68,11 @@ func TestBuildDeclaresProviderCapabilities(t *testing.T) {
 		t.Fatal("plugin does not register its OAuth callback resource")
 	}
 	registered, errRegister := caps.ManagementAPI.RegisterManagement(context.Background(), pluginapi.ManagementRegistrationRequest{ResourceBasePath: "/v0/resource/plugins/mirasim"})
-	if errRegister != nil || len(registered.Routes) != 0 {
+	if errRegister != nil || len(registered.Routes) != 1 {
 		t.Fatalf("management registration = %#v, error = %v", registered, errRegister)
+	}
+	if route := registered.Routes[0]; route.Method != http.MethodGet || route.Path != "/mirasim/quota" || route.Handler == nil || route.Menu != "" {
+		t.Fatalf("legacy card route = %#v", route)
 	}
 	// Named so the email sign-in task only adds its routes here; the quota page
 	// is matched by prefix because its path carries a random segment.

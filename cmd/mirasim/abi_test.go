@@ -157,8 +157,9 @@ func TestABIServesTheOAuthCallbackResource(t *testing.T) {
 	if errDecode := json.Unmarshal(envelope.Result, &registration); errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	if len(registration.Routes) != 0 {
-		t.Fatalf("registration = %#v", registration)
+	if len(registration.Routes) != 1 || registration.Routes[0].Method != http.MethodGet ||
+		registration.Routes[0].Path != "/mirasim/quota" || registration.Routes[0].Menu != "" {
+		t.Fatalf("legacy quota registration = %#v", registration.Routes)
 	}
 	// Named so the email sign-in task only adds its routes here; the quota page
 	// is matched by prefix because its path carries a random segment.

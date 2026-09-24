@@ -2,12 +2,14 @@ package plugin
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/auth"
 	pluginconfig "github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/config"
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/credentials"
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/executor"
+	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/legacyquota"
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/mirasim"
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/models"
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/quota"
@@ -16,12 +18,13 @@ import (
 )
 
 type MirasimPlugin struct {
-	auth      *auth.Provider
-	models    *models.Provider
-	executor  *executor.Executor
-	thinking  *thinkingpkg.Applier
-	quota     *quota.Provider
-	quotaPage *quotapage.Page
+	auth        *auth.Provider
+	models      *models.Provider
+	executor    *executor.Executor
+	thinking    *thinkingpkg.Applier
+	quota       *quota.Provider
+	quotaPage   *quotapage.Page
+	legacyQuota *legacyquota.Handler
 }
 
 func Build(configYAML []byte) pluginapi.Plugin {
@@ -35,12 +38,13 @@ func Build(configYAML []byte) pluginapi.Plugin {
 	authProvider := auth.New(settings, pool)
 	quotaProvider := quota.New(settings, pool)
 	p := &MirasimPlugin{
-		auth:      authProvider,
-		models:    models.New(settings, pool),
-		executor:  executor.New(settings, pool),
-		thinking:  thinkingpkg.NewApplier(),
-		quota:     quotaProvider,
-		quotaPage: quotapage.New(quotaProvider),
+		auth:        authProvider,
+		models:      models.New(settings, pool),
+		executor:    executor.New(settings, pool),
+		thinking:    thinkingpkg.NewApplier(),
+		quota:       quotaProvider,
+		quotaPage:   quotapage.New(quotaProvider),
+		legacyQuota: legacyquota.New(settings, pool),
 	}
 	return pluginapi.Plugin{
 		Metadata: pluginapi.Metadata{
@@ -141,6 +145,14 @@ func (p *MirasimPlugin) RegisterManagement(ctx context.Context, req pluginapi.Ma
 	// so set it here the way the OAuth provider sets it on its own routes.
 	quotaRoute.Handler = p
 	registered.Resources = append(registered.Resources, quotaRoute)
+	// Older pinned Management Center builds still render a Mirasim quota card
+	// through this authenticated route. Keep it as a compatibility endpoint.
+	registered.Routes = append(registered.Routes, pluginapi.ManagementRoute{
+		Method:      http.MethodGet,
+		Path:        legacyquota.Route,
+		Description: "Compatibility quota response for older Mirasim Management Center cards.",
+		Handler:     p,
+	})
 	return registered, nil
 }
 
@@ -157,6 +169,9 @@ func (p *MirasimPlugin) HandleManagement(ctx context.Context, req pluginapi.Mana
 func (p *MirasimPlugin) HandleManagementWithHost(ctx context.Context, req pluginapi.ManagementRequest, host quotapage.HostServices) (pluginapi.ManagementResponse, error) {
 	if p.quotaPage != nil && p.quotaPage.Owns(req.Path) {
 		return p.quotaPage.Serve(ctx, req, host)
+	}
+	if p.legacyQuota != nil && legacyquota.Owns(req.Path) {
+		return p.legacyQuota.Serve(ctx, req, host)
 	}
 	return p.auth.HandleManagement(ctx, req)
 }
