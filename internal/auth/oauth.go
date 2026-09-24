@@ -368,7 +368,12 @@ func (p *Provider) handleOAuthEmailSend(ctx context.Context, req pluginapi.Manag
 	now := p.oauth.now()
 	if session.emailSends >= maxEmailCodeSends || (!session.emailSentAt.IsZero() && now.Sub(session.emailSentAt) < emailCodeSendInterval) {
 		remaining := maxEmailCodeSends - session.emailSends
-		limited := remaining > 0
+		// The wait notice tells the operator a code already arrived, which is
+		// only true once a send actually reached Mirasim: after a failed send
+		// the login is unpinned and nothing was mailed, so the notice would
+		// point at a code that does not exist. The count branch renders its own
+		// "no sends remain" text with or without it.
+		limited := remaining > 0 && session.emailMailed
 		p.oauth.mu.Unlock()
 		// The code-entry form again, with the wait notice when the interval is
 		// what blocked the resend: an impatient click must not cost the operator

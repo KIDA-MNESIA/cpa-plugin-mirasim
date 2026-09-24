@@ -666,6 +666,11 @@ func TestEmailSendPinsTheFirstMailedAddress(t *testing.T) {
 // flight upstream: the pin is committed before the outbound call, so this holds
 // whatever emailLoginTimeout and emailCodeSendInterval are set to. The first
 // send is held inside Mirasim until after the assertion.
+//
+// This is a structural-ordering tripwire, not a demonstrated takeover: on the
+// old ordering this send is still refused, by the rate limiter's 429 rather
+// than by the pin, and exploitability there additionally needed
+// emailLoginTimeout > emailCodeSendInterval.
 func TestEmailSendCannotRepointALoginWhileASendIsInFlight(t *testing.T) {
 	provider, fake := newEmailLoginProvider(t)
 	started, errStart := provider.StartLogin(context.Background(), startRequest())
@@ -759,6 +764,187 @@ func TestEmailSendFailureLeavesTheAddressUnpinned(t *testing.T) {
 	provider.oauth.mu.Unlock()
 	if pinned != "correct@example.com" {
 		t.Fatalf("pinned address = %q, want the corrected address", pinned)
+	}
+}
+
+// Once a code has been mailed, a later send that fails must not clear the pin:
+// the mailed code is still live, and clearing the address would let the next
+// send bind the login to a different account. This is the sequential half of
+// the emailMailed guard, with no concurrency involved.
+func TestEmailSendFailureCannotUnpinAMailedAddress(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	provider.oauth.now = func() time.Time { return now }
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	send := func(address string) (int, string) {
+		return serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+			"state":           []string{started.State},
+			emailAddressField: []string{address},
+		})
+	}
+	if status, body := send("first@example.com"); status != http.StatusOK {
+		t.Fatalf("first send = %d, body = %s", status, body)
+	}
+	// The resend goes to the pinned address and Mirasim rejects it; the code
+	// from the first send is still live, so the pin has to survive.
+	fake.failCodeRequests()
+	now = now.Add(emailCodeSendInterval)
+	if status, body := send("first@example.com"); status != http.StatusBadGateway {
+		t.Fatalf("failed resend = %d, body = %s", status, body)
+	}
+	provider.oauth.mu.Lock()
+	session := provider.oauth.sessions[started.State]
+	pinned, mailed, sends := session.email, session.emailMailed, session.emailSends
+	provider.oauth.mu.Unlock()
+	if pinned != "first@example.com" || !mailed || sends != 2 {
+		t.Fatalf("after a failed resend address = %q, mailed = %v, sends = %d; want the pin kept", pinned, mailed, sends)
+	}
+	fake.acceptCodeRequests()
+	now = now.Add(emailCodeSendInterval)
+	status, body := send("attacker@example.com")
+	if status != http.StatusConflict || !strings.Contains(body, "bound to another address") {
+		t.Fatalf("a different address after the failed resend = %d, body = %s", status, body)
+	}
+	if addresses := fake.sentAddresses(); len(addresses) != 2 || addresses[1] != "first@example.com" {
+		t.Fatalf("code requests = %#v, want only the pinned address twice", addresses)
+	}
+}
+
+// While one code request is still in flight, a sibling send's failure must not
+// clear the pin the first one committed: the first may still mail, so the
+// address has to survive until the last send settles. This is the in-flight
+// half of the guard; the overlap is forced by holding the first request inside
+// Mirasim, not by the send interval.
+func TestEmailSendFailureCannotUnpinASiblingInFlight(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	provider.oauth.now = func() time.Time { return now }
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	arrived, release := fake.holdCodeRequests()
+	defer release()
+	type outcome struct {
+		status int
+		body   string
+		err    error
+	}
+	first := make(chan outcome, 1)
+	go func() {
+		resp, errHandle := provider.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+			Method: http.MethodGet,
+			Path:   testResourceBasePath + OAuthEmailSendResource,
+			Query: url.Values{
+				"state":           []string{started.State},
+				emailAddressField: []string{"first@example.com"},
+			},
+		})
+		first <- outcome{status: resp.StatusCode, body: string(resp.Body), err: errHandle}
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first code request never reached Mirasim")
+	}
+	// A second send to the same address runs while the first is still held and
+	// fails after the first has committed its pin.
+	fake.clearHold()
+	fake.failCodeRequests()
+	now = now.Add(emailCodeSendInterval)
+	if status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"first@example.com"},
+	}); status != http.StatusBadGateway {
+		t.Fatalf("overlapping failed send = %d, body = %s", status, body)
+	}
+	provider.oauth.mu.Lock()
+	session := provider.oauth.sessions[started.State]
+	pinned, inFlight := session.email, session.emailSendsInFlight
+	provider.oauth.mu.Unlock()
+	if pinned != "first@example.com" || inFlight != 1 {
+		t.Fatalf("after one of two overlapping sends failed address = %q, in flight = %d; want the pin kept while the first still mails", pinned, inFlight)
+	}
+	release()
+	got := <-first
+	if got.err != nil || got.status != http.StatusOK {
+		t.Fatalf("held send = %d, body = %s, err = %v", got.status, got.body, got.err)
+	}
+	provider.oauth.mu.Lock()
+	pinned, mailed := provider.oauth.sessions[started.State].email, provider.oauth.sessions[started.State].emailMailed
+	provider.oauth.mu.Unlock()
+	if pinned != "first@example.com" || !mailed {
+		t.Fatalf("after the held send succeeded address = %q, mailed = %v; want the address of the send that mailed", pinned, mailed)
+	}
+	// The surviving pin still refuses an address change.
+	now = now.Add(emailCodeSendInterval)
+	status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"attacker@example.com"},
+	})
+	if status != http.StatusConflict || !strings.Contains(body, "bound to another address") {
+		t.Fatalf("a different address after the overlap = %d, body = %s", status, body)
+	}
+	for _, address := range fake.sentAddresses() {
+		if address == "attacker@example.com" {
+			t.Fatal("the attacker's address reached Mirasim")
+		}
+	}
+}
+
+// The rate-limit page's wait notice says a code already arrived, so it must
+// only render when one was actually mailed: after a failed send the login is
+// unpinned and nothing went out, and an immediate retry — even with the
+// corrected address — must not be told to enter a code that does not exist.
+func TestEmailSendFailureDoesNotClaimACodeArrived(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	provider.oauth.now = func() time.Time { return now }
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	send := func(address string) (int, string) {
+		return serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+			"state":           []string{started.State},
+			emailAddressField: []string{address},
+		})
+	}
+	fake.failCodeRequests()
+	if status, body := send("typo@example.com"); status != http.StatusBadGateway {
+		t.Fatalf("failed send = %d, body = %s", status, body)
+	}
+	// The corrected address is no longer pinned out, but the login is still
+	// inside the send interval. No code exists to enter.
+	status, body := send("correct@example.com")
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("immediate retry = %d, body = %s", status, body)
+	}
+	if strings.Contains(body, "already received") {
+		t.Fatalf("the wait notice claimed a code arrived after a failed send:\n%s", body)
+	}
+	if !strings.Contains(body, "one minute apart") {
+		t.Fatalf("the rate-limit page dropped the interval explanation:\n%s", body)
+	}
+	// Positive control: after a send does reach Mirasim, the same notice is
+	// correct and stays.
+	fake.acceptCodeRequests()
+	now = now.Add(emailCodeSendInterval)
+	if status, body := send("correct@example.com"); status != http.StatusOK {
+		t.Fatalf("corrected send = %d, body = %s", status, body)
+	}
+	status, body = send("correct@example.com")
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("immediate resend after a successful send = %d", status)
+	}
+	if !strings.Contains(body, "already received") {
+		t.Fatalf("the wait notice is missing after a code was mailed:\n%s", body)
+	}
+	if strings.Contains(body, "typo@example.com") || strings.Contains(body, "correct@example.com") {
+		t.Fatal("the rate-limit page reflected an address")
 	}
 }
 
@@ -1588,6 +1774,14 @@ func (f *emailAuthFake) holdCodeRequests() (<-chan struct{}, func()) {
 	f.hold = hold
 	f.mu.Unlock()
 	return hold.started, func() { hold.once.Do(func() { close(hold.release) }) }
+}
+
+// clearHold stops holding requests that have not arrived yet; a request already
+// parked in the fake stays parked until its release function runs.
+func (f *emailAuthFake) clearHold() {
+	f.mu.Lock()
+	f.hold = nil
+	f.mu.Unlock()
 }
 
 func (f *emailAuthFake) rejectCodes() {
