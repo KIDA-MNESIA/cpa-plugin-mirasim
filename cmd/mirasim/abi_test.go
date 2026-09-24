@@ -160,24 +160,30 @@ func TestABIServesTheOAuthCallbackResource(t *testing.T) {
 	if len(registration.Routes) != 0 {
 		t.Fatalf("registration = %#v", registration)
 	}
+	// Named so the email sign-in task only adds its routes here; the quota page
+	// is matched by prefix because its path carries a random segment.
+	expectedResources := []string{"/oauth/start", "/oauth/authorize", "/oauth/callback"}
 	paths := make(map[string]pluginapi.ResourceRoute, len(registration.Resources))
-	menuRoute := pluginapi.ResourceRoute{}
 	for _, resource := range registration.Resources {
 		paths[resource.Path] = resource
-		if resource.Menu != "" {
-			menuRoute = resource
-		}
 	}
-	for _, path := range []string{"/oauth/start", "/oauth/authorize", "/oauth/callback"} {
+	for _, path := range expectedResources {
 		if _, ok := paths[path]; !ok {
 			t.Fatalf("registration is missing %s: %#v", path, registration.Resources)
 		}
 	}
 	// The panel lists the plugin's menus and embeds each menu's path, so the
 	// quota page is reachable only while its label survives this round trip.
-	if !strings.HasPrefix(menuRoute.Path, "/quota/") || menuRoute.Menu == "" || menuRoute.Description == "" {
-		t.Fatalf("quota menu route = %#v", menuRoute)
+	quotaRoutes := make([]pluginapi.ResourceRoute, 0, 1)
+	for _, resource := range registration.Resources {
+		if strings.HasPrefix(resource.Path, "/quota/") && resource.Menu != "" {
+			quotaRoutes = append(quotaRoutes, resource)
+		}
 	}
+	if len(quotaRoutes) != 1 || quotaRoutes[0].Description == "" {
+		t.Fatalf("quota menu route = %#v, want one /quota/ route carrying a menu label and description", quotaRoutes)
+	}
+	menuRoute := quotaRoutes[0]
 
 	// The quota page answers the same management.handle call the OAuth callback
 	// does, and its path only exists in the registration read above. No host

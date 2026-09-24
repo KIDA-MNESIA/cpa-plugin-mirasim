@@ -71,28 +71,28 @@ func TestBuildDeclaresProviderCapabilities(t *testing.T) {
 	if errRegister != nil || len(registered.Routes) != 0 {
 		t.Fatalf("management registration = %#v, error = %v", registered, errRegister)
 	}
-	paths := make(map[string]bool, len(registered.Resources))
-	menuRoutes := 0
+	// Named so the email sign-in task only adds its routes here; the quota page
+	// is matched by prefix because its path carries a random segment.
+	expectedResources := []string{"/oauth/start", "/oauth/authorize", "/oauth/callback"}
+	paths := make(map[string]pluginapi.ResourceRoute, len(registered.Resources))
 	for _, resource := range registered.Resources {
-		paths[resource.Path] = true
-		if resource.Menu == "" {
-			continue
-		}
-		menuRoutes++
-		// The quota page is the one route that must carry a menu label: only
-		// menus reach the panel, and the login resources are reached from a
-		// login URL instead.
-		if !strings.HasPrefix(resource.Path, "/quota/") {
-			t.Fatalf("menu route path = %q, want a /quota/ page", resource.Path)
-		}
+		paths[resource.Path] = resource
 	}
-	for _, path := range []string{"/oauth/start", "/oauth/authorize", "/oauth/callback"} {
-		if !paths[path] {
+	for _, path := range expectedResources {
+		if _, ok := paths[path]; !ok {
 			t.Fatalf("management registration is missing %s: %#v", path, registered.Resources)
 		}
 	}
-	if menuRoutes != 1 {
-		t.Fatalf("menu routes = %d, want exactly the quota page: %#v", menuRoutes, registered.Resources)
+	// Only menus reach the panel, so the quota page is the one route that must
+	// carry a menu label; the login resources are reached from a login URL.
+	quotaRoutes := make([]pluginapi.ResourceRoute, 0, 1)
+	for _, resource := range registered.Resources {
+		if strings.HasPrefix(resource.Path, "/quota/") && resource.Menu != "" {
+			quotaRoutes = append(quotaRoutes, resource)
+		}
+	}
+	if len(quotaRoutes) != 1 {
+		t.Fatalf("quota menu route = %#v, want exactly one /quota/ route carrying a menu label", quotaRoutes)
 	}
 	if caps.ExecutorModelScope != pluginapi.ExecutorModelScopeOAuth {
 		t.Fatalf("executor scope = %q", caps.ExecutorModelScope)
