@@ -604,6 +604,178 @@ func TestEmailVerifyUsesTheAddressStoredAtSend(t *testing.T) {
 	}
 }
 
+// The login belongs to the first address a code was actually mailed to: a
+// later send naming another address is refused without spending a send or
+// moving the pin, and verify still checks the code against the pinned one.
+func TestEmailSendPinsTheFirstMailedAddress(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	provider.oauth.now = func() time.Time { return now }
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	send := func(address string) (int, string) {
+		return serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+			"state":           []string{started.State},
+			emailAddressField: []string{address},
+		})
+	}
+	if status, body := send("first@example.com"); status != http.StatusOK {
+		t.Fatalf("first send = %d, body = %s", status, body)
+	}
+	now = now.Add(emailCodeSendInterval)
+	status, body := send("attacker@example.com")
+	if status != http.StatusConflict || !strings.Contains(body, "bound to another address") {
+		t.Fatalf("second-address send = %d, body = %s", status, body)
+	}
+	if strings.Contains(body, "first@example.com") || strings.Contains(body, "attacker@example.com") {
+		t.Fatal("the refusal page reflected an address")
+	}
+	if addresses := fake.sentAddresses(); len(addresses) != 1 || addresses[0] != "first@example.com" {
+		t.Fatalf("code requests = %#v, want only the pinned address", addresses)
+	}
+	provider.oauth.mu.Lock()
+	pinned, sends := provider.oauth.sessions[started.State].email, provider.oauth.sessions[started.State].emailSends
+	provider.oauth.mu.Unlock()
+	if pinned != "first@example.com" || sends != 1 {
+		t.Fatalf("pinned address = %q, sends = %d, want the first address and one spent send", pinned, sends)
+	}
+	// The verify request cannot retarget the login either: the pinned address
+	// is the one Mirasim checks the code against.
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"attacker@example.com"},
+		emailCodeField:    []string{"123456"},
+	}); status != http.StatusOK {
+		t.Fatalf("verify status = %d", status)
+	}
+	if calls := fake.verifyCalls(); len(calls) != 1 || calls[0] != (emailVerifyCall{email: "first@example.com", code: "123456"}) {
+		t.Fatalf("verify calls = %#v, want the pinned address", calls)
+	}
+}
+
+// A send Mirasim rejects still spends one of the login's three sends, but it
+// does not pin the address, so a typo can be corrected on the next send.
+func TestEmailSendFailureLeavesTheAddressUnpinned(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	provider.oauth.now = func() time.Time { return now }
+	fake.failCodeRequests()
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	send := func(address string) (int, string) {
+		return serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+			"state":           []string{started.State},
+			emailAddressField: []string{address},
+		})
+	}
+	if status, body := send("typo@example.com"); status != http.StatusBadGateway || !strings.Contains(body, "did not send") {
+		t.Fatalf("failed send = %d, body = %s", status, body)
+	}
+	provider.oauth.mu.Lock()
+	session := provider.oauth.sessions[started.State]
+	pinned, sends := session.email, session.emailSends
+	provider.oauth.mu.Unlock()
+	if pinned != "" || sends != 1 {
+		t.Fatalf("after a failed send address = %q, sends = %d, want no pin and one spent send", pinned, sends)
+	}
+	fake.acceptCodeRequests()
+	now = now.Add(emailCodeSendInterval)
+	if status, body := send("correct@example.com"); status != http.StatusOK {
+		t.Fatalf("corrected send = %d, body = %s", status, body)
+	}
+	if addresses := fake.sentAddresses(); len(addresses) != 2 || addresses[0] != "typo@example.com" || addresses[1] != "correct@example.com" {
+		t.Fatalf("code requests = %#v, want the typo then the corrected address", addresses)
+	}
+	provider.oauth.mu.Lock()
+	pinned = provider.oauth.sessions[started.State].email
+	provider.oauth.mu.Unlock()
+	if pinned != "correct@example.com" {
+		t.Fatalf("pinned address = %q, want the corrected address", pinned)
+	}
+}
+
+// The code page shows how many sends remain and can mail another code to the
+// pinned address without asking for it again.
+func TestEmailCodePageOffersAResendThatNeedsOnlyTheState(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	provider.oauth.now = func() time.Time { return now }
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"user@example.com"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("send status = %d, body = %s", status, body)
+	}
+	for _, want := range []string{`action="send"`, `name="state" value="` + started.State + `"`, "Resend code", "2 of 3 code sends remain"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("code page lacks %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `name="`+emailAddressField+`"`) {
+		t.Fatal("the resend form asks for the address again")
+	}
+	now = now.Add(emailCodeSendInterval)
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state": []string{started.State},
+	}); status != http.StatusOK {
+		t.Fatalf("resend with only the state = %d", status)
+	}
+	if addresses := fake.sentAddresses(); len(addresses) != 2 || addresses[1] != "user@example.com" {
+		t.Fatalf("code requests = %#v, want the resend to reach the pinned address", addresses)
+	}
+}
+
+// An exhausted email login reads as the failure it is rather than as the
+// "already used" page, on every page of the flow.
+func TestExhaustedEmailLoginReadsAsFailed(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"user@example.com"},
+	}); status != http.StatusOK {
+		t.Fatalf("send status = %d", status)
+	}
+	fake.rejectCodes()
+	for attempt := 0; attempt < maxEmailVerifyAttempts; attempt++ {
+		serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+			"state":        []string{started.State},
+			emailCodeField: []string{"bad-code"},
+		})
+	}
+	page := serveStartPage(t, provider, started.State)
+	if page.StatusCode != http.StatusBadRequest || !strings.Contains(string(page.Body), "Too many code attempts") {
+		t.Fatalf("start page after exhaustion = %d, body = %s", page.StatusCode, page.Body)
+	}
+	if strings.Contains(string(page.Body), "already used") {
+		t.Fatal("the exhausted login still reads as a used callback")
+	}
+	if status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"user@example.com"},
+	}); status != http.StatusBadRequest || !strings.Contains(body, "Too many code attempts") {
+		t.Fatalf("send on an exhausted login = %d, body = %s", status, body)
+	}
+	if status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+		"state":        []string{started.State},
+		emailCodeField: []string{"123456"},
+	}); status != http.StatusBadRequest || !strings.Contains(body, "Too many code attempts") {
+		t.Fatalf("verify on an exhausted login = %d, body = %s", status, body)
+	}
+}
+
 // An exhausted attempt budget fails the login, and PollLogin reports it.
 func TestEmailVerifyAttemptsAreBoundedAndExhaustTheLogin(t *testing.T) {
 	provider, fake := newEmailLoginProvider(t)
@@ -643,12 +815,13 @@ func TestEmailVerifyAttemptsAreBoundedAndExhaustTheLogin(t *testing.T) {
 	if polled.Status != pluginapi.AuthLoginStatusError || !strings.Contains(polled.Message, "too many code attempts") {
 		t.Fatalf("PollLogin() = %#v", polled)
 	}
-	// The failed login refuses another code without spending an attempt.
-	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+	// The failed login reads as failed rather than as a used callback, and it
+	// refuses another code without spending an attempt.
+	if status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
 		"state":        []string{started.State},
 		emailCodeField: []string{"123456"},
-	}); status != http.StatusConflict {
-		t.Fatalf("verify on a failed login = %d", status)
+	}); status != http.StatusBadRequest || !strings.Contains(body, "Too many code attempts") {
+		t.Fatalf("verify on a failed login = %d, body = %s", status, body)
 	}
 	if calls := fake.verifyCalls(); len(calls) != maxEmailVerifyAttempts {
 		t.Fatalf("a verify on a failed login reached Mirasim: %#v", calls)
@@ -1324,6 +1497,7 @@ type emailAuthFake struct {
 	sent     []string
 	verified []emailVerifyCall
 	reject   bool
+	sendFail bool
 }
 
 func (f *emailAuthFake) rejectCodes() {
@@ -1335,6 +1509,18 @@ func (f *emailAuthFake) rejectCodes() {
 func (f *emailAuthFake) acceptCodes() {
 	f.mu.Lock()
 	f.reject = false
+	f.mu.Unlock()
+}
+
+func (f *emailAuthFake) failCodeRequests() {
+	f.mu.Lock()
+	f.sendFail = true
+	f.mu.Unlock()
+}
+
+func (f *emailAuthFake) acceptCodeRequests() {
+	f.mu.Lock()
+	f.sendFail = false
 	f.mu.Unlock()
 }
 
@@ -1359,7 +1545,13 @@ func (f *emailAuthFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.mu.Lock()
 		f.sent = append(f.sent, body["email"])
+		fail := f.sendFail
 		f.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"detail":"mail transport unavailable"}`))
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]string{})
 	case r.URL.Path == "/auth/me" && r.Method == http.MethodGet:
 		// finalizeOAuthStorage treats the plan-state refresh as best-effort, so

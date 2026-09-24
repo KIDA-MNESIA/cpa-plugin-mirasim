@@ -86,8 +86,10 @@ type oauthSession struct {
 	// proxyURL is the host proxy Mirasim calls go through, captured at
 	// StartLogin because resource handlers get no host services.
 	proxyURL string
-	// email is the address a code was sent to. Verify reads it from here, never
-	// from its own request, so the route cannot be pointed at other addresses.
+	// email is the address the first code was successfully mailed to, and the
+	// only address verify checks a code against. It stays empty until a send
+	// succeeds, so a failed send leaves a typo fixable; once set it pins the
+	// login, and a later send naming another address is refused.
 	email string
 	// emailSentAt and emailSends rate limit the send route on this login.
 	emailSentAt time.Time
@@ -104,6 +106,13 @@ type oauthSession struct {
 	auth          *pluginapi.AuthData
 }
 
+// emailExhausted reports whether this login failed through the email code
+// attempt budget. An exhausted login is a failure rather than a used callback,
+// so the pages that report it answer with the failure page.
+func (s *oauthSession) emailExhausted() bool {
+	return s.emailAttempts >= maxEmailVerifyAttempts
+}
+
 type oauthCoordinator struct {
 	mu       sync.Mutex
 	sessions map[string]*oauthSession
@@ -117,9 +126,10 @@ func newOAuthCoordinator() *oauthCoordinator {
 	return &oauthCoordinator{sessions: make(map[string]*oauthSession), now: time.Now}
 }
 
-// RegisterManagement mounts the two browser-facing routes this plugin owns,
-// both served on CPA's own port under the plugin resource prefix: the login
-// start page and the OAuth callback.
+// RegisterManagement mounts the five browser-facing routes this plugin owns,
+// all served on CPA's own port under the plugin resource prefix: the login
+// start page, the provider redirect, the OAuth callback, and the two
+// email-code routes (send and verify).
 //
 // Mirasim only redirects to a loopback address, so the browser always lands on
 // 127.0.0.1 of its own machine. Serving the callback on CPA's port rather than
@@ -280,7 +290,11 @@ func (p *Provider) handleOAuthAuthorize(req pluginapi.ManagementRequest) plugina
 		return callbackPageResponse(http.StatusBadRequest, startExpiredPage)
 	}
 	if session.callbackDone || session.auth != nil {
+		exhausted := session.emailExhausted()
 		p.oauth.mu.Unlock()
+		if exhausted {
+			return callbackPageResponse(http.StatusBadRequest, emailAttemptsPage)
+		}
 		return callbackPageResponse(http.StatusConflict, callbackUsedPage)
 	}
 	if !providerOffered(session.providers, provider) {
@@ -302,10 +316,10 @@ func (p *Provider) handleOAuthAuthorize(req pluginapi.ManagementRequest) plugina
 }
 
 // handleOAuthEmailSend mails a sign-in code for the pending login named by the
-// request's state. The address travels in the page's form, is stored on the
-// session for the verify step, and is never reflected back into a response. A
-// resource handler gets no host services, so the outbound call goes through the
-// proxy recorded when the login started.
+// request's state. The address travels in the page's form, pins the login only
+// once Mirasim confirms the mail, and is never reflected back into a response.
+// A resource handler gets no host services, so the outbound call goes through
+// the proxy recorded when the login started.
 func (p *Provider) handleOAuthEmailSend(ctx context.Context, req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	state := strings.TrimSpace(req.Query.Get("state"))
 
@@ -317,33 +331,64 @@ func (p *Provider) handleOAuthEmailSend(ctx context.Context, req pluginapi.Manag
 		return callbackPageResponse(http.StatusBadRequest, startExpiredPage)
 	}
 	if session.callbackDone || session.auth != nil {
+		exhausted := session.emailExhausted()
 		p.oauth.mu.Unlock()
+		if exhausted {
+			return callbackPageResponse(http.StatusBadRequest, emailAttemptsPage)
+		}
 		return callbackPageResponse(http.StatusConflict, callbackUsedPage)
+	}
+	// A send whose form carries no address is the code page's resend: the login
+	// is already pinned, so the state is all it needs to carry.
+	address := strings.TrimSpace(req.Query.Get(emailAddressField))
+	if address == "" && session.email != "" {
+		address = session.email
+	} else {
+		normalized, errAddress := normalizeLoginEmail(address)
+		if errAddress != nil {
+			p.oauth.mu.Unlock()
+			return callbackPageResponse(http.StatusBadRequest, emailAddressPage)
+		}
+		address = normalized
+	}
+	// The login belongs to the first address a code was actually mailed to. A
+	// later send naming another address cannot re-point it, so learning a state
+	// is not enough to have the credential saved under a different account.
+	if session.email != "" && address != session.email {
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusConflict, emailAddressPinnedPage)
 	}
 	now := p.oauth.now()
 	if session.emailSends >= maxEmailCodeSends || (!session.emailSentAt.IsZero() && now.Sub(session.emailSentAt) < emailCodeSendInterval) {
 		p.oauth.mu.Unlock()
 		return callbackPageResponse(http.StatusTooManyRequests, emailCodeLimitedPage)
 	}
-	address, errAddress := normalizeLoginEmail(req.Query.Get(emailAddressField))
-	if errAddress != nil {
-		p.oauth.mu.Unlock()
-		return callbackPageResponse(http.StatusBadRequest, emailAddressPage)
-	}
 	// Spend the send before the outbound call: the request leaves this process
 	// even when Mirasim rejects it, so only counting successes would leave the
 	// relay unbounded. Doing it under the lock that checked the interval also
-	// turns two concurrent submits into one send.
+	// turns two concurrent submits into one send. The address itself is pinned
+	// only after Mirasim confirms the mail, so a send that fails upstream leaves
+	// the address unpinned and a typo fixable.
 	session.emailSends++
 	session.emailSentAt = now
-	session.email = address
 	proxyURL := session.proxyURL
 	p.oauth.mu.Unlock()
 
 	if errSend := requestEmailCode(ctx, p.settings.AdminURL, proxyURL, address); errSend != nil {
 		return callbackPageResponse(http.StatusBadGateway, emailSendFailedPage)
 	}
-	return emailCodePageResponse(state, http.StatusOK, false)
+
+	p.oauth.mu.Lock()
+	p.oauth.purgeLocked(p.oauth.now())
+	remaining := 0
+	if current := p.oauth.sessions[state]; current != nil && current == session {
+		if !current.callbackDone && current.auth == nil && current.email == "" {
+			current.email = address
+		}
+		remaining = maxEmailCodeSends - current.emailSends
+	}
+	p.oauth.mu.Unlock()
+	return emailCodePageResponse(state, http.StatusOK, false, remaining)
 }
 
 // handleOAuthEmailVerify exchanges the code entered on the code page for
@@ -364,7 +409,11 @@ func (p *Provider) handleOAuthEmailVerify(ctx context.Context, req pluginapi.Man
 		return callbackPageResponse(http.StatusBadRequest, startExpiredPage)
 	}
 	if session.callbackDone || session.auth != nil {
+		exhausted := session.emailExhausted()
 		p.oauth.mu.Unlock()
+		if exhausted {
+			return callbackPageResponse(http.StatusBadRequest, emailAttemptsPage)
+		}
 		return callbackPageResponse(http.StatusConflict, callbackUsedPage)
 	}
 	// Verification without a send on this login has nothing to check, so it
@@ -375,8 +424,9 @@ func (p *Provider) handleOAuthEmailVerify(ctx context.Context, req pluginapi.Man
 	}
 	code, errCode := normalizeLoginCode(req.Query.Get(emailCodeField))
 	if errCode != nil {
+		remaining := maxEmailCodeSends - session.emailSends
 		p.oauth.mu.Unlock()
-		return emailCodePageResponse(state, http.StatusBadRequest, true)
+		return emailCodePageResponse(state, http.StatusBadRequest, true, remaining)
 	}
 	address, proxyURL := session.email, session.proxyURL
 	p.oauth.mu.Unlock()
@@ -392,6 +442,9 @@ func (p *Provider) handleOAuthEmailVerify(ctx context.Context, req pluginapi.Man
 	}
 	if session.callbackDone || session.auth != nil {
 		accessToken, refreshToken = "", ""
+		if session.emailExhausted() {
+			return callbackPageResponse(http.StatusBadRequest, emailAttemptsPage)
+		}
 		return callbackPageResponse(http.StatusConflict, callbackUsedPage)
 	}
 	if errVerify != nil {
@@ -405,7 +458,7 @@ func (p *Provider) handleOAuthEmailVerify(ctx context.Context, req pluginapi.Man
 			session.errorMessage = "Mirasim email sign-in failed: too many code attempts"
 			return callbackPageResponse(http.StatusBadRequest, emailAttemptsPage)
 		}
-		return emailCodePageResponse(state, http.StatusBadRequest, true)
+		return emailCodePageResponse(state, http.StatusBadRequest, true, maxEmailCodeSends-session.emailSends)
 	}
 	session.callbackDone = true
 	session.accessToken = accessToken

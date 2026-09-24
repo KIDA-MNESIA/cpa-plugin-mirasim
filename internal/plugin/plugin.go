@@ -54,7 +54,7 @@ func Build(configYAML []byte) pluginapi.Plugin {
 				{Name: "relay-url", Type: pluginapi.ConfigFieldTypeString, Description: "Mirasim relay base URL."},
 				{Name: "admin-url", Type: pluginapi.ConfigFieldTypeString, Description: "Mirasim authentication service base URL."},
 				{Name: "client-version", Type: pluginapi.ConfigFieldTypeString, Description: "Value sent in x-mirasim-client."},
-				{Name: "oauth-login-provider", Type: pluginapi.ConfigFieldTypeString, Description: "Mirasim sign-in provider used for browser login when the request names none. Defaults to github."},
+				{Name: "oauth-login-provider", Type: pluginapi.ConfigFieldTypeString, Description: "Mirasim sign-in provider marked as the default button on the browser login page; the operator can still choose another. Defaults to github."},
 				{Name: "oauth-callback-port", Type: pluginapi.ConfigFieldTypeInteger, Description: "Fixed 127.0.0.1 port for the --mirasim-login callback. Management Center logins return through CPA's own port instead. Unset takes an ephemeral port."},
 				{Name: "http1-only", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Skip HTTP/2 negotiation on Mirasim relay calls."},
 				{Name: "lowercase-relay-headers", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Send Mirasim relay header names in lower case. Implies HTTP/1.1."},

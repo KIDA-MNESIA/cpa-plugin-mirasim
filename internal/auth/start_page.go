@@ -20,8 +20,11 @@ const pastedCallbackField = "token_url"
 // emailAddressField names the start page's address field and emailCodeField
 // names the code-entry page's code field. Both forms are GET-only, because CPA
 // routes resource requests only for GET, so the values travel in the query
-// string; CPA's request log masks every query value whose name contains
-// "token", and an account address and a sign-in code both belong in that set.
+// string; CPA's request log runs HideAPIKey over every query value whose name
+// contains "token", and an account address and a sign-in code both belong in
+// that set. That masking is partial — it keeps a head and tail and logs values
+// of two characters or fewer verbatim, so a six-digit code still shows four of
+// its digits (123456 logs as 12...56) and the log line stays sensitive.
 const (
 	emailAddressField = "token_email"
 	emailCodeField    = "token_code"
@@ -66,7 +69,11 @@ func (c *oauthCoordinator) startPage(state string) pluginapi.ManagementResponse 
 		return callbackPageResponse(http.StatusBadRequest, startExpiredPage)
 	}
 	if session.callbackDone || session.auth != nil {
+		exhausted := session.emailExhausted()
 		c.mu.Unlock()
+		if exhausted {
+			return callbackPageResponse(http.StatusBadRequest, emailAttemptsPage)
+		}
 		return callbackPageResponse(http.StatusConflict, callbackUsedPage)
 	}
 	data := startPageData{State: session.state, CallbackURL: session.callbackURL, Field: pastedCallbackField, EmailField: emailAddressField, Minutes: int(oauthLoginTTL.Minutes())}
@@ -130,11 +137,11 @@ var startPageTemplate = template.Must(template.New("start").Parse(`<!doctype htm
 	`</body></html>`))
 
 // emailCodePageResponse renders the code-entry form for one login. Only the
-// login's own state is placed in it, so neither the address nor the code ever
-// reaches the browser through the page.
-func emailCodePageResponse(state string, status int, retry bool) pluginapi.ManagementResponse {
+// login's own state and its remaining code sends are placed in it, so neither
+// the address nor the code ever reaches the browser through the page.
+func emailCodePageResponse(state string, status int, retry bool, remaining int) pluginapi.ManagementResponse {
 	var body bytes.Buffer
-	data := emailCodePageData{State: state, Field: emailCodeField, Retry: retry, Minutes: int(oauthLoginTTL.Minutes())}
+	data := emailCodePageData{State: state, Field: emailCodeField, Retry: retry, Remaining: remaining, Max: maxEmailCodeSends, Minutes: int(oauthLoginTTL.Minutes())}
 	if errRender := emailCodePageTemplate.Execute(&body, data); errRender != nil {
 		return callbackPageResponse(http.StatusInternalServerError, callbackNotFoundPage)
 	}
@@ -150,10 +157,12 @@ func formPageResponse(status int, body []byte) pluginapi.ManagementResponse {
 }
 
 type emailCodePageData struct {
-	State   string
-	Field   string
-	Retry   bool
-	Minutes int
+	State     string
+	Field     string
+	Retry     bool
+	Remaining int
+	Max       int
+	Minutes   int
 }
 
 // emailCodePageTemplate asks for the code Mirasim mailed. The action is
@@ -170,6 +179,9 @@ var emailCodePageTemplate = template.Must(template.New("email-code").Parse(`<!do
 	`{{if .Retry}}<p class="notice">验证码未通过，请重试。</p><p class="en notice">That code was not accepted. Try again.</p>{{end}}` +
 	`<form method="get" action="verify"><input type="hidden" name="state" value="{{.State}}"><input type="text" name="{{.Field}}" required autocomplete="one-time-code" inputmode="numeric" spellcheck="false" placeholder="123456">` +
 	`<button type="submit">完成登录 / Verify code</button></form>` +
+	`{{if .Remaining}}<form method="get" action="send"><input type="hidden" name="state" value="{{.State}}"><button type="submit">重新发送验证码 / Resend code</button></form>` +
+	`<p>本次登录还可发送 {{.Remaining}} 次验证码（最多 {{.Max}} 次）。</p><p class="en">{{.Remaining}} of {{.Max}} code sends remain for this sign-in.</p>{{else}}` +
+	`<p class="notice">本次登录的验证码发送次数已用完；如仍未收到验证码，请重新开始登录。</p><p class="en notice">No code sends remain for this sign-in; if the mail does not arrive, start the sign-in again.</p>{{end}}` +
 	`<p>本次登录 {{.Minutes}} 分钟内有效。</p><p class="en">This sign-in expires {{.Minutes}} minutes after it was started.</p>` +
 	`</body></html>`))
 
@@ -192,6 +204,10 @@ const (
 	emailAddressPage = callbackPagePrefix + `<title>Invalid email address</title></head><body>` +
 		`<h1>Enter a valid email address</h1><p>Go back to the Mirasim sign-in page and enter the address of an account that signs in by mail. The sign-in is still waiting.</p>` +
 		`<p>请输入有效的邮箱地址。请返回登录页面重新填写，本次登录仍然有效。</p></body></html>`
+
+	emailAddressPinnedPage = callbackPagePrefix + `<title>Address already bound</title></head><body>` +
+		`<h1>This sign-in is bound to another address</h1><p>The first address a code was mailed to owns this sign-in. Start the Mirasim login again from Management Center to use a different address.</p>` +
+		`<p>本次登录已绑定到最先收到验证码的邮箱，不能再改用其他地址。如需更换，请回到管理面板重新开始 Mirasim 登录。</p></body></html>`
 
 	emailCodeLimitedPage = callbackPagePrefix + `<title>Too many code requests</title></head><body>` +
 		`<h1>Too many code requests</h1><p>Wait a minute before requesting another code. The sign-in is still waiting.</p>` +
