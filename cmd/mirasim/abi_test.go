@@ -157,7 +157,7 @@ func TestABIServesTheOAuthCallbackResource(t *testing.T) {
 	if errDecode := json.Unmarshal(envelope.Result, &registration); errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	if len(registration.Routes) != 0 || len(registration.Resources) != 1 || registration.Resources[0].Path != "/oauth/callback" {
+	if len(registration.Routes) != 0 || len(registration.Resources) != 2 || registration.Resources[0].Path != "/oauth/start" || registration.Resources[1].Path != "/oauth/callback" {
 		t.Fatalf("registration = %#v", registration)
 	}
 

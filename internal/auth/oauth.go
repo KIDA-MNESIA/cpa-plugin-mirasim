@@ -31,8 +31,12 @@ const (
 	// tells the plugin when Management Center abandons a login, so the oldest one
 	// is dropped to make room rather than refusing the next.
 	maxOAuthSessions = 8
-	// OAuthCallbackResource is the resource route, under the plugin's resource
-	// prefix on CPA's own port, that receives the Mirasim browser callback.
+	// OAuthStartResource is the resource route, under the plugin's resource
+	// prefix on CPA's own port, that Management Center's "open link" button
+	// opens: it links to Mirasim and takes the callback URL pasted back.
+	OAuthStartResource = "/oauth/start"
+	// OAuthCallbackResource is the resource route, under the same prefix, that
+	// receives the Mirasim browser callback.
 	OAuthCallbackResource = "/oauth/callback"
 	// fallbackLoginProvider is the last resort when neither the caller nor the
 	// configuration names a Mirasim sign-in provider.
@@ -42,6 +46,8 @@ const (
 type oauthSession struct {
 	state        string
 	provider     string
+	authURL      string
+	callbackURL  string
 	expiresAt    time.Time
 	accessToken  string
 	refreshToken string
@@ -64,42 +70,64 @@ func newOAuthCoordinator() *oauthCoordinator {
 	return &oauthCoordinator{sessions: make(map[string]*oauthSession), now: time.Now}
 }
 
-// RegisterManagement mounts the one browser-facing route this plugin owns: the
-// OAuth callback, served on CPA's own port under the plugin resource prefix.
+// RegisterManagement mounts the two browser-facing routes this plugin owns,
+// both served on CPA's own port under the plugin resource prefix: the login
+// start page and the OAuth callback.
 //
 // Mirasim only redirects to a loopback address, so the browser always lands on
 // 127.0.0.1 of its own machine. Serving the callback on CPA's port rather than
 // on a listener of the plugin's own is what lets it arrive wherever that port
 // is already reachable: a host-local CPA, a published Docker port, or an SSH
-// tunnel to CPA. Where it is not, the operator can replace 127.0.0.1:<port> in
-// the refused URL with the address Management Center is opened on.
+// tunnel to CPA. Where it is not, the start page takes the refused URL pasted
+// back and sends it to the callback on the address the page itself was opened
+// on.
 func (p *Provider) RegisterManagement(_ context.Context, req pluginapi.ManagementRegistrationRequest) (pluginapi.ManagementRegistrationResponse, error) {
 	p.oauth.mu.Lock()
 	p.oauth.resourceBasePath = strings.TrimRight(strings.TrimSpace(req.ResourceBasePath), "/")
 	p.oauth.mu.Unlock()
 	return pluginapi.ManagementRegistrationResponse{Resources: []pluginapi.ResourceRoute{
+		{Path: OAuthStartResource, Description: "Starts a Mirasim browser OAuth login.", Handler: p},
 		{Path: OAuthCallbackResource, Description: "Receives a Mirasim browser OAuth callback.", Handler: p},
 	}}, nil
 }
 
-// HandleManagement serves the OAuth callback resource. CPA does not
-// authenticate resource routes, so the callback is accepted only when its state
-// names a pending login, only once, and no response ever reflects a credential
-// or any part of one.
+// HandleManagement serves the start page and the OAuth callback. CPA does not
+// authenticate resource routes, so both answer only for the state of a pending
+// login, the callback is accepted only once, and no response ever reflects a
+// credential or any part of one.
 func (p *Provider) HandleManagement(_ context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
 	p.oauth.mu.Lock()
-	callbackPath := p.oauth.resourceBasePath + OAuthCallbackResource
+	basePath := p.oauth.resourceBasePath
 	p.oauth.mu.Unlock()
-	if !strings.EqualFold(req.Method, http.MethodGet) || req.Path != callbackPath {
+	if !strings.EqualFold(req.Method, http.MethodGet) || basePath == "" {
 		return callbackPageResponse(http.StatusNotFound, callbackNotFoundPage), nil
 	}
-	status, page := p.oauth.acceptCallback(oauthResultFromValues(req.Query))
-	return callbackPageResponse(status, page), nil
+	switch req.Path {
+	case basePath + OAuthStartResource:
+		return p.oauth.startPage(req.Query.Get("state")), nil
+	case basePath + OAuthCallbackResource:
+		if pasted, okPasted := req.Query[pastedCallbackField]; okPasted {
+			result, okResult := pastedCallbackResult(strings.Join(pasted, ""))
+			if !okResult {
+				// A wrong paste is the operator's slip, not Mirasim's answer, so it
+				// must not use up the login.
+				return callbackPageResponse(http.StatusBadRequest, callbackPastePage), nil
+			}
+			status, page := p.oauth.acceptCallback(result)
+			return callbackPageResponse(status, page), nil
+		}
+		status, page := p.oauth.acceptCallback(oauthResultFromValues(req.Query))
+		return callbackPageResponse(status, page), nil
+	default:
+		return callbackPageResponse(http.StatusNotFound, callbackNotFoundPage), nil
+	}
 }
 
-// StartLogin drives CPA's native plugin login abstraction: the host registers the
-// returned State, the browser follows the returned Mirasim authorize URL, and the
-// callback returns to the resource route registered above.
+// StartLogin drives CPA's native plugin login abstraction: the host registers
+// the returned State, and Management Center opens the returned URL. That URL is
+// the start page, and it is relative on purpose: Management Center opens it
+// against its own address, which is the one address the browser is known to
+// reach CPA on, while the host only ever reports 127.0.0.1.
 func (p *Provider) StartLogin(ctx context.Context, req pluginapi.AuthLoginStartRequest) (pluginapi.AuthLoginStartResponse, error) {
 	if provider := strings.TrimSpace(req.Provider); provider != "" && !strings.EqualFold(provider, credentials.Provider) {
 		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("unsupported OAuth provider %q", provider)
@@ -145,17 +173,19 @@ func (p *Provider) StartLogin(ctx context.Context, req pluginapi.AuthLoginStartR
 		return pluginapi.AuthLoginStartResponse{}, errURL
 	}
 
+	startURL := url.URL{Path: resourceBasePath + OAuthStartResource, RawQuery: url.Values{"state": []string{state}}.Encode()}
+
 	now := p.oauth.now()
 	expiresAt := now.Add(oauthLoginTTL)
 	p.oauth.mu.Lock()
 	p.oauth.purgeLocked(now)
 	p.oauth.makeRoomLocked()
-	p.oauth.sessions[state] = &oauthSession{state: state, provider: loginProvider, expiresAt: expiresAt}
+	p.oauth.sessions[state] = &oauthSession{state: state, provider: loginProvider, authURL: authURL, callbackURL: callbackURL.String(), expiresAt: expiresAt}
 	p.oauth.mu.Unlock()
 
 	return pluginapi.AuthLoginStartResponse{
 		Provider:  credentials.Provider,
-		URL:       authURL,
+		URL:       startURL.String(),
 		State:     state,
 		ExpiresAt: expiresAt,
 		Metadata: map[string]any{

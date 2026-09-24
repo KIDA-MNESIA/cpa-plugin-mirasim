@@ -16,12 +16,12 @@ func TestBuildDeclaresProviderCapabilities(t *testing.T) {
 	if caps.AuthProvider == nil || caps.ModelProvider == nil || caps.Executor == nil || caps.ThinkingApplier == nil || caps.CommandLinePlugin == nil || caps.QuotaProvider == nil {
 		t.Fatalf("capabilities are incomplete: %#v", caps)
 	}
-	// The Management API capability carries the one OAuth callback resource.
+	// The Management API capability carries the OAuth start page and callback.
 	if caps.ManagementAPI == nil {
 		t.Fatal("plugin does not register its OAuth callback resource")
 	}
 	registered, errRegister := caps.ManagementAPI.RegisterManagement(context.Background(), pluginapi.ManagementRegistrationRequest{ResourceBasePath: "/v0/resource/plugins/mirasim"})
-	if errRegister != nil || len(registered.Routes) != 0 || len(registered.Resources) != 1 {
+	if errRegister != nil || len(registered.Routes) != 0 || len(registered.Resources) != 2 {
 		t.Fatalf("management registration = %#v, error = %v", registered, errRegister)
 	}
 	if caps.ExecutorModelScope != pluginapi.ExecutorModelScopeOAuth {

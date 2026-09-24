@@ -6,9 +6,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -20,7 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/mirasim"
 )
 
-func TestRegisterManagementMountsOnlyTheCallbackResource(t *testing.T) {
+func TestRegisterManagementMountsOnlyTheLoginResources(t *testing.T) {
 	provider := New(pluginconfig.Defaults(), mirasim.NewPool())
 	registered, errRegister := provider.RegisterManagement(context.Background(), pluginapi.ManagementRegistrationRequest{ResourceBasePath: testResourceBasePath})
 	if errRegister != nil {
@@ -29,8 +31,13 @@ func TestRegisterManagementMountsOnlyTheCallbackResource(t *testing.T) {
 	if len(registered.Routes) != 0 {
 		t.Fatalf("management routes = %#v, want none", registered.Routes)
 	}
-	if len(registered.Resources) != 1 || registered.Resources[0].Path != OAuthCallbackResource || registered.Resources[0].Handler == nil {
+	if len(registered.Resources) != 2 || registered.Resources[0].Path != OAuthStartResource || registered.Resources[1].Path != OAuthCallbackResource {
 		t.Fatalf("resources = %#v", registered.Resources)
+	}
+	for _, resource := range registered.Resources {
+		if resource.Handler == nil {
+			t.Fatalf("resource %s has no handler", resource.Path)
+		}
 	}
 }
 
@@ -45,7 +52,12 @@ func TestStartLoginReturnsTheBrowserThroughCPAsOwnPort(t *testing.T) {
 	if started.Provider != credentials.Provider || started.State == "" {
 		t.Fatalf("start response = %#v", started)
 	}
-	authorize := mustParseURL(t, started.URL)
+	// Relative, so Management Center opens it on the address it is itself
+	// reached on rather than on the 127.0.0.1 CPA reports.
+	if want := testResourceBasePath + OAuthStartResource + "?state=" + started.State; started.URL != want {
+		t.Fatalf("start URL = %q, want %q", started.URL, want)
+	}
+	authorize := mustParseURL(t, authorizeURLOf(t, provider, started))
 	if authorize.Host != mustParseURL(t, adminURL).Host || authorize.Path != "/auth/oauth/github/login" {
 		t.Fatalf("authorize URL = %s", authorize)
 	}
@@ -54,7 +66,7 @@ func TestStartLoginReturnsTheBrowserThroughCPAsOwnPort(t *testing.T) {
 	if authorize.Query().Get("state") != started.State {
 		t.Fatalf("authorize state = %q, want %q", authorize.Query().Get("state"), started.State)
 	}
-	callbackURL := mustParseURL(t, callbackURLOf(t, started.URL))
+	callbackURL := mustParseURL(t, callbackURLOf(t, authorize.String()))
 	if callbackURL.Scheme != "http" || callbackURL.Host != "127.0.0.1:8317" || callbackURL.Path != testResourceBasePath+OAuthCallbackResource {
 		t.Fatalf("redirect_uri = %s, want CPA's own port and the callback resource", callbackURL)
 	}
@@ -65,7 +77,7 @@ func TestStartLoginReturnsTheBrowserThroughCPAsOwnPort(t *testing.T) {
 		t.Fatalf("start metadata contains a token: %s", raw)
 	}
 
-	status, body := deliverCallback(t, provider, started, url.Values{
+	status, body := deliverCallback(t, provider, callbackAddressOf(t, provider, started), url.Values{
 		"access_token":  []string{accessToken},
 		"refresh_token": []string{"refresh-secret"},
 	})
@@ -139,7 +151,7 @@ func TestCallbackWithoutRefreshTokenIsRefusedAndSavesNothing(t *testing.T) {
 		t.Fatal(errStart)
 	}
 	accessToken := identityJWT("account-9", "user@example.com", time.Now().Add(time.Hour))
-	status, body := deliverCallback(t, provider, started, url.Values{"access_token": []string{accessToken}})
+	status, body := deliverCallback(t, provider, callbackAddressOf(t, provider, started), url.Values{"access_token": []string{accessToken}})
 	if status != http.StatusBadRequest {
 		t.Fatalf("incomplete callback status = %d", status)
 	}
@@ -161,12 +173,13 @@ func TestSecondCallbackForTheSameLoginIsRejected(t *testing.T) {
 	if errStart != nil {
 		t.Fatal(errStart)
 	}
+	callbackURL := callbackAddressOf(t, provider, started)
 	first := url.Values{"access_token": []string{identityJWT("account-1", "", time.Now().Add(time.Hour))}, "refresh_token": []string{"refresh-first"}}
-	if status, _ := deliverCallback(t, provider, started, first); status != http.StatusOK {
+	if status, _ := deliverCallback(t, provider, callbackURL, first); status != http.StatusOK {
 		t.Fatalf("first callback status = %d", status)
 	}
 	second := url.Values{"access_token": []string{identityJWT("account-2", "", time.Now().Add(time.Hour))}, "refresh_token": []string{"refresh-second"}}
-	if status, body := deliverCallback(t, provider, started, second); status != http.StatusConflict || !strings.Contains(body, "already used") {
+	if status, body := deliverCallback(t, provider, callbackURL, second); status != http.StatusConflict || !strings.Contains(body, "already used") {
 		t.Fatalf("second callback status = %d, body = %s", status, body)
 	}
 	provider.oauth.mu.Lock()
@@ -184,7 +197,7 @@ func TestOversizedCallbackCredentialsAreRefusedWithoutQuotingThem(t *testing.T) 
 		t.Fatal(errStart)
 	}
 	oversized := strings.Repeat("a", maxOAuthCredentialLen+1)
-	status, _ := deliverCallback(t, provider, started, url.Values{"access_token": []string{oversized}, "refresh_token": []string{"refresh"}})
+	status, _ := deliverCallback(t, provider, callbackAddressOf(t, provider, started), url.Values{"access_token": []string{oversized}, "refresh_token": []string{"refresh"}})
 	if status != http.StatusBadRequest {
 		t.Fatalf("oversized callback status = %d", status)
 	}
@@ -198,13 +211,113 @@ func TestCallbackResourceAnswersOnlyItsOwnPathAndGet(t *testing.T) {
 	provider, _ := newLoginProvider(t, pluginconfig.Defaults())
 	for _, req := range []pluginapi.ManagementRequest{
 		{Method: http.MethodPost, Path: testResourceBasePath + OAuthCallbackResource},
-		{Method: http.MethodGet, Path: testResourceBasePath + "/oauth/start"},
+		{Method: http.MethodGet, Path: testResourceBasePath + "/oauth/other"},
 		{Method: http.MethodGet, Path: "/v0/resource/plugins/other" + OAuthCallbackResource},
 	} {
 		resp, errHandle := provider.HandleManagement(context.Background(), req)
 		if errHandle != nil || resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("%s %s = %d, error = %v", req.Method, req.Path, resp.StatusCode, errHandle)
 		}
+	}
+}
+
+// Where the browser cannot reach 127.0.0.1:<CPA port>, the operator pastes the
+// refused address into the start page, which submits it to the callback on the
+// address the page was opened on. The host part of the paste does not matter.
+func TestStartPageTakesThePastedCallbackURL(t *testing.T) {
+	provider, _ := newLoginProvider(t, pluginconfig.Defaults())
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	page := serveStartPage(t, provider, started.State)
+	if page.StatusCode != http.StatusOK {
+		t.Fatalf("start page status = %d", page.StatusCode)
+	}
+	if csp := page.Headers.Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self'") || !strings.Contains(csp, "default-src 'none'") {
+		t.Fatalf("start page CSP = %q", csp)
+	}
+	body := string(page.Body)
+	for _, want := range []string{`action="callback"`, `name="` + pastedCallbackField + `"`, `rel="noopener noreferrer"`, "提交回调 URL"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("start page lacks %q:\n%s", want, body)
+		}
+	}
+	// The pasted field has to be one CPA's request log masks.
+	if !strings.Contains(pastedCallbackField, "token") {
+		t.Fatalf("paste field %q would be logged unmasked by CPA", pastedCallbackField)
+	}
+
+	accessToken := identityJWT("account-5", "user@example.com", time.Now().Add(time.Hour))
+	for name, host := range map[string]string{"as Mirasim sent it": "", "already edited": "cpa.example.com"} {
+		login, errLogin := provider.StartLogin(context.Background(), startRequest())
+		if errLogin != nil {
+			t.Fatal(errLogin)
+		}
+		pasted := mustParseURL(t, callbackURLOf(t, authorizeURLOf(t, provider, login)))
+		if host != "" {
+			pasted.Scheme, pasted.Host = "https", host
+		}
+		query := pasted.Query()
+		query.Set("access_token", accessToken)
+		query.Set("refresh_token", "refresh-secret")
+		pasted.RawQuery = query.Encode()
+
+		status, done := serveCallback(t, provider, testResourceBasePath+OAuthCallbackResource, url.Values{pastedCallbackField: []string{"  " + pasted.String() + "\n"}})
+		if status != http.StatusOK || !strings.Contains(done, "sign-in complete") || strings.Contains(done, "refresh-secret") {
+			t.Fatalf("%s: pasted callback = %d %s", name, status, done)
+		}
+		polled, _ := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: login.State, HTTPClient: oauthValidationClient{}})
+		if polled.Status != pluginapi.AuthLoginStatusSuccess {
+			t.Fatalf("%s: PollLogin() = %#v", name, polled)
+		}
+	}
+}
+
+// Pasting the wrong thing is the operator's slip rather than Mirasim's answer,
+// so it must leave the login waiting for the right paste.
+func TestAMistakenPasteLeavesTheLoginWaiting(t *testing.T) {
+	provider, _ := newLoginProvider(t, pluginconfig.Defaults())
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	authorizeURL := authorizeURLOf(t, provider, started)
+	callbackURL := callbackURLOf(t, authorizeURL)
+	for name, pasted := range map[string]string{
+		"empty":          "   ",
+		"not a URL":      "%zz",
+		"authorize URL":  authorizeURL,
+		"no credentials": callbackURL,
+		"no state":       "https://127.0.0.1:8317" + testResourceBasePath + OAuthCallbackResource + "?access_token=a&refresh_token=r",
+		"too long":       callbackURL + "&access_token=" + strings.Repeat("a", maxPastedCallbackLen),
+	} {
+		status, body := serveCallback(t, provider, testResourceBasePath+OAuthCallbackResource, url.Values{pastedCallbackField: []string{pasted}})
+		if status != http.StatusBadRequest || !strings.Contains(body, "not the Mirasim callback address") || strings.Contains(body, "aaaa") {
+			t.Fatalf("%s paste = %d %s", name, status, body)
+		}
+		if polled, _ := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: started.State}); polled.Status != pluginapi.AuthLoginStatusPending {
+			t.Fatalf("%s paste ended the login: %#v", name, polled)
+		}
+	}
+}
+
+func TestStartPageAnswersOnlyForAPendingLogin(t *testing.T) {
+	provider, _ := newLoginProvider(t, pluginconfig.Defaults())
+	for _, state := range []string{"", "not-a-session"} {
+		if page := serveStartPage(t, provider, state); page.StatusCode != http.StatusBadRequest || !strings.Contains(string(page.Body), "expired") {
+			t.Fatalf("start page for %q = %d %s", state, page.StatusCode, page.Body)
+		}
+	}
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	if status, _ := deliverCallback(t, provider, callbackAddressOf(t, provider, started), url.Values{"access_token": []string{"access"}, "refresh_token": []string{"refresh"}}); status != http.StatusOK {
+		t.Fatalf("callback status = %d", status)
+	}
+	if page := serveStartPage(t, provider, started.State); page.StatusCode != http.StatusConflict {
+		t.Fatalf("start page after the callback = %d", page.StatusCode)
 	}
 }
 
@@ -219,7 +332,7 @@ func TestStartLoginRefusesACallbackOriginMirasimWouldReject(t *testing.T) {
 	if errStart != nil {
 		t.Fatalf("TLS loopback BaseURL error = %v", errStart)
 	}
-	if callback := mustParseURL(t, callbackURLOf(t, started.URL)); callback.Scheme != "https" || callback.Host != "127.0.0.1:8443" {
+	if callback := mustParseURL(t, callbackURLOf(t, authorizeURLOf(t, provider, started))); callback.Scheme != "https" || callback.Host != "127.0.0.1:8443" {
 		t.Fatalf("redirect_uri = %s, want the TLS origin CPA named", callback)
 	}
 }
@@ -290,7 +403,7 @@ func TestLoginProviderResolutionPrefersRequestThenConfigThenGithub(t *testing.T)
 	if errRequested != nil {
 		t.Fatal(errRequested)
 	}
-	if path := mustParseURL(t, requested.URL).Path; path != "/auth/oauth/github/login" {
+	if path := mustParseURL(t, authorizeURLOf(t, provider, requested)).Path; path != "/auth/oauth/github/login" {
 		t.Fatalf("requested provider path = %q", path)
 	}
 
@@ -298,7 +411,7 @@ func TestLoginProviderResolutionPrefersRequestThenConfigThenGithub(t *testing.T)
 	if errConfigured != nil {
 		t.Fatal(errConfigured)
 	}
-	if path := mustParseURL(t, configured.URL).Path; path != "/auth/oauth/google/login" {
+	if path := mustParseURL(t, authorizeURLOf(t, provider, configured)).Path; path != "/auth/oauth/google/login" {
 		t.Fatalf("configured provider path = %q", path)
 	}
 
@@ -307,7 +420,7 @@ func TestLoginProviderResolutionPrefersRequestThenConfigThenGithub(t *testing.T)
 	if errFallback != nil {
 		t.Fatal(errFallback)
 	}
-	if path := mustParseURL(t, fallback.URL).Path; path != "/auth/oauth/github/login" {
+	if path := mustParseURL(t, authorizeURLOf(t, provider, fallback)).Path; path != "/auth/oauth/github/login" {
 		t.Fatalf("fallback provider path = %q", path)
 	}
 }
@@ -405,8 +518,9 @@ func TestPendingLoginExpiresAndRefusesALateCallback(t *testing.T) {
 		t.Fatalf("pending poll = %#v", pending)
 	}
 
+	callbackURL := callbackAddressOf(t, provider, started)
 	now = now.Add(oauthLoginTTL + time.Second)
-	if status, _ := deliverCallback(t, provider, started, url.Values{"access_token": []string{"access"}, "refresh_token": []string{"refresh"}}); status != http.StatusBadRequest {
+	if status, _ := deliverCallback(t, provider, callbackURL, url.Values{"access_token": []string{"access"}, "refresh_token": []string{"refresh"}}); status != http.StatusBadRequest {
 		t.Fatalf("late callback status = %d", status)
 	}
 	expired, _ := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: started.State})
@@ -421,7 +535,7 @@ func TestCancelledCallbackFailsTheLoginWithoutReflectingProviderDetail(t *testin
 	if errStart != nil {
 		t.Fatal(errStart)
 	}
-	status, body := deliverCallback(t, provider, started, url.Values{
+	status, body := deliverCallback(t, provider, callbackAddressOf(t, provider, started), url.Values{
 		"error":             []string{"access_denied"},
 		"error_description": []string{"do-not-reflect"},
 	})
@@ -440,7 +554,7 @@ func TestPollLoginRejectsCredentialsThatFailRemoteValidation(t *testing.T) {
 	if errStart != nil {
 		t.Fatal(errStart)
 	}
-	if status, _ := deliverCallback(t, provider, started, url.Values{
+	if status, _ := deliverCallback(t, provider, callbackAddressOf(t, provider, started), url.Values{
 		"access_token":  []string{identityJWT("rejected", "", time.Now().Add(time.Hour))},
 		"refresh_token": []string{"refresh-secret"},
 	}); status != http.StatusOK {
@@ -508,11 +622,53 @@ func callbackURLOf(t *testing.T, authorizeURL string) string {
 	return callback
 }
 
+// serveStartPage opens the start page the way Management Center's "open link"
+// button does.
+func serveStartPage(t *testing.T, provider *Provider, state string) pluginapi.ManagementResponse {
+	t.Helper()
+	resp, errHandle := provider.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   testResourceBasePath + OAuthStartResource,
+		Query:  url.Values{"state": []string{state}},
+	})
+	if errHandle != nil {
+		t.Fatalf("HandleManagement(start) error = %v", errHandle)
+	}
+	return resp
+}
+
+var startPageAuthorizeLink = regexp.MustCompile(`<a class="button" href="([^"]+)"`)
+
+// authorizeURLOf follows a started login to the Mirasim authorize URL its start
+// page links to.
+func authorizeURLOf(t *testing.T, provider *Provider, started pluginapi.AuthLoginStartResponse) string {
+	t.Helper()
+	startURL := mustParseURL(t, started.URL)
+	if startURL.IsAbs() || startURL.Path != testResourceBasePath+OAuthStartResource {
+		t.Fatalf("start URL = %q, want the relative start page", started.URL)
+	}
+	page := serveStartPage(t, provider, startURL.Query().Get("state"))
+	if page.StatusCode != http.StatusOK {
+		t.Fatalf("start page status = %d, body = %s", page.StatusCode, page.Body)
+	}
+	match := startPageAuthorizeLink.FindSubmatch(page.Body)
+	if match == nil {
+		t.Fatalf("start page carries no authorize link:\n%s", page.Body)
+	}
+	return html.UnescapeString(string(match[1]))
+}
+
+// callbackAddressOf is the redirect_uri a started login hands Mirasim.
+func callbackAddressOf(t *testing.T, provider *Provider, started pluginapi.AuthLoginStartResponse) string {
+	t.Helper()
+	return callbackURLOf(t, authorizeURLOf(t, provider, started))
+}
+
 // deliverCallback plays Mirasim's part: it appends the given values to the
 // query redirect_uri already carries and sends the browser to the result.
-func deliverCallback(t *testing.T, provider *Provider, started pluginapi.AuthLoginStartResponse, appended url.Values) (int, string) {
+func deliverCallback(t *testing.T, provider *Provider, callbackURL string, appended url.Values) (int, string) {
 	t.Helper()
-	callback := mustParseURL(t, callbackURLOf(t, started.URL))
+	callback := mustParseURL(t, callbackURL)
 	query := callback.Query()
 	for key, values := range appended {
 		query[key] = append(query[key], values...)

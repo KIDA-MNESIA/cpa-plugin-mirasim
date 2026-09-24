@@ -43,7 +43,7 @@ func TestDiscoveredProvidersControlWhichLoginsMayStart(t *testing.T) {
 	if errStarted != nil {
 		t.Fatalf("discovered provider rejected: %v", errStarted)
 	}
-	if path := mustParseURL(t, started.URL).Path; path != "/auth/oauth/gitlab/login" {
+	if path := mustParseURL(t, authorizeURLOf(t, p, started)).Path; path != "/auth/oauth/gitlab/login" {
 		t.Fatalf("authorize path = %q", path)
 	}
 
