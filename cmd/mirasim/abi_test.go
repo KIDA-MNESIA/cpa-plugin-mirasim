@@ -157,8 +157,58 @@ func TestABIServesTheOAuthCallbackResource(t *testing.T) {
 	if errDecode := json.Unmarshal(envelope.Result, &registration); errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	if len(registration.Routes) != 0 || len(registration.Resources) != 2 || registration.Resources[0].Path != "/oauth/start" || registration.Resources[1].Path != "/oauth/callback" {
+	if len(registration.Routes) != 0 {
 		t.Fatalf("registration = %#v", registration)
+	}
+	paths := make(map[string]pluginapi.ResourceRoute, len(registration.Resources))
+	menuRoute := pluginapi.ResourceRoute{}
+	for _, resource := range registration.Resources {
+		paths[resource.Path] = resource
+		if resource.Menu != "" {
+			menuRoute = resource
+		}
+	}
+	for _, path := range []string{"/oauth/start", "/oauth/callback"} {
+		if _, ok := paths[path]; !ok {
+			t.Fatalf("registration is missing %s: %#v", path, registration.Resources)
+		}
+	}
+	// The panel lists the plugin's menus and embeds each menu's path, so the
+	// quota page is reachable only while its label survives this round trip.
+	if !strings.HasPrefix(menuRoute.Path, "/quota/") || menuRoute.Menu == "" || menuRoute.Description == "" {
+		t.Fatalf("quota menu route = %#v", menuRoute)
+	}
+
+	// The quota page answers the same management.handle call the OAuth callback
+	// does, and its path only exists in the registration read above. No host
+	// is installed in this test binary, so the page reports the missing
+	// credential callbacks rather than limits; what RoundTrip has to prove is
+	// that this path reaches the quota page (its CSP allows the panel iframe)
+	// instead of the OAuth handler's 404.
+	quotaRequest, errMarshal := json.Marshal(map[string]any{
+		"Method":           http.MethodGet,
+		"Path":             "/v0/resource/plugins/mirasim" + menuRoute.Path,
+		"host_callback_id": "cb-1",
+	})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	raw, errCall = handleABIMethod(context.Background(), pluginabi.MethodManagementHandle, quotaRequest)
+	if errCall != nil {
+		t.Fatal(errCall)
+	}
+	if errDecode := json.Unmarshal(raw, &envelope); errDecode != nil || !envelope.OK {
+		t.Fatalf("quota handle envelope = %s, error = %v", raw, errDecode)
+	}
+	var quotaPage pluginapi.ManagementResponse
+	if errDecode := json.Unmarshal(envelope.Result, &quotaPage); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if quotaPage.StatusCode != http.StatusOK || len(quotaPage.Body) == 0 {
+		t.Fatalf("quota page = %d %s", quotaPage.StatusCode, quotaPage.Body)
+	}
+	if policy := quotaPage.Headers.Get("Content-Security-Policy"); !strings.Contains(policy, "frame-ancestors 'self'") {
+		t.Fatalf("quota page CSP does not allow the panel iframe: %q", policy)
 	}
 
 	raw, errCall = handleABIMethod(context.Background(), pluginabi.MethodManagementHandle, []byte(`{"Method":"GET","Path":"/v0/resource/plugins/mirasim/oauth/callback","Query":{"state":["not-a-session"]},"host_callback_id":"cb-1"}`))

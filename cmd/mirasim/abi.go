@@ -58,6 +58,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	pluginconfig "github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/config"
 	mirasimplugin "github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/plugin"
+	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/quotapage"
 )
 
 var abiState = struct {
@@ -181,7 +182,61 @@ type abiManagementRegistration struct {
 
 type abiResourceRoute struct {
 	Path        string `json:"Path"`
+	Menu        string `json:"Menu,omitempty"`
 	Description string `json:"Description,omitempty"`
+}
+
+// abiManagementRequest mirrors the host's rpcManagementRequest. The host
+// attaches host_callback_id to every management and resource request, and it
+// is the only way a handler reaches host.auth.list, host.auth.get or the host
+// HTTP client.
+type abiManagementRequest struct {
+	pluginapi.ManagementRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type abiHostAuthListResponse struct {
+	Files []pluginapi.HostAuthFileEntry `json:"files"`
+}
+
+type abiHostAuthGetRequest struct {
+	pluginapi.HostAuthGetRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+// abiHostServices implements quotapage.HostServices over the host callbacks a
+// resource request may use. The host resolves the callback ID to the open
+// callback context of the request being served, so these calls stop working
+// once that request is answered.
+type abiHostServices struct {
+	callbackID string
+}
+
+var _ quotapage.HostServices = abiHostServices{}
+
+func (s abiHostServices) ListAuth(context.Context) ([]pluginapi.HostAuthFileEntry, error) {
+	resp, errCall := callHost[abiHostAuthListResponse](pluginabi.MethodHostAuthList, abiHostAuthListRequest{HostCallbackID: s.callbackID})
+	if errCall != nil {
+		return nil, errCall
+	}
+	return resp.Files, nil
+}
+
+func (s abiHostServices) GetAuth(_ context.Context, authIndex string) (pluginapi.HostAuthGetResponse, error) {
+	return callHost[pluginapi.HostAuthGetResponse](pluginabi.MethodHostAuthGet, abiHostAuthGetRequest{
+		HostAuthGetRequest: pluginapi.HostAuthGetRequest{AuthIndex: authIndex},
+		HostCallbackID:     s.callbackID,
+	})
+}
+
+func (s abiHostServices) HTTPClient() pluginapi.HostHTTPClient {
+	return abiHostHTTPClient{callbackID: s.callbackID}
+}
+
+// abiHostAuthListRequest carries only the callback ID: the host's auth list
+// callback ignores the rest of the request.
+type abiHostAuthListRequest struct {
+	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
 type abiExecutorStreamResponse struct {
@@ -434,11 +489,11 @@ func handleABIMethod(ctx context.Context, method string, request []byte) ([]byte
 		}
 		return abiOKEnvelope(toABIManagementRegistration(resp))
 	case pluginabi.MethodManagementHandle:
-		var req pluginapi.ManagementRequest
-		if errDecode := json.Unmarshal(request, &req); errDecode != nil {
+		var rpcReq abiManagementRequest
+		if errDecode := json.Unmarshal(request, &rpcReq); errDecode != nil {
 			return nil, errDecode
 		}
-		resp, errCall := p.HandleManagement(ctx, req)
+		resp, errCall := p.HandleManagementWithHost(ctx, rpcReq.ManagementRequest, abiHostServices{callbackID: rpcReq.HostCallbackID})
 		return abiOKEnvelopeWithError(resp, errCall)
 	case pluginabi.MethodQuotaDescribe:
 		var req pluginapi.QuotaDescribeRequest
@@ -550,7 +605,7 @@ func currentPlugin() (*mirasimplugin.MirasimPlugin, error) {
 func toABIManagementRegistration(resp pluginapi.ManagementRegistrationResponse) abiManagementRegistration {
 	out := abiManagementRegistration{Resources: make([]abiResourceRoute, 0, len(resp.Resources))}
 	for _, resource := range resp.Resources {
-		out.Resources = append(out.Resources, abiResourceRoute{Path: resource.Path, Description: resource.Description})
+		out.Resources = append(out.Resources, abiResourceRoute{Path: resource.Path, Menu: resource.Menu, Description: resource.Description})
 	}
 	return out
 }

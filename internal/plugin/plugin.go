@@ -11,15 +11,17 @@ import (
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/mirasim"
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/models"
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/quota"
+	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/quotapage"
 	thinkingpkg "github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/thinking"
 )
 
 type MirasimPlugin struct {
-	auth     *auth.Provider
-	models   *models.Provider
-	executor *executor.Executor
-	thinking *thinkingpkg.Applier
-	quota    *quota.Provider
+	auth      *auth.Provider
+	models    *models.Provider
+	executor  *executor.Executor
+	thinking  *thinkingpkg.Applier
+	quota     *quota.Provider
+	quotaPage *quotapage.Page
 }
 
 func Build(configYAML []byte) pluginapi.Plugin {
@@ -31,12 +33,14 @@ func Build(configYAML []byte) pluginapi.Plugin {
 		LowercaseRelayHeaders: settings.LowercaseRelayHeaders != nil && *settings.LowercaseRelayHeaders,
 	})
 	authProvider := auth.New(settings, pool)
+	quotaProvider := quota.New(settings, pool)
 	p := &MirasimPlugin{
-		auth:     authProvider,
-		models:   models.New(settings, pool),
-		executor: executor.New(settings, pool),
-		thinking: thinkingpkg.NewApplier(),
-		quota:    quota.New(settings, pool),
+		auth:      authProvider,
+		models:    models.New(settings, pool),
+		executor:  executor.New(settings, pool),
+		thinking:  thinkingpkg.NewApplier(),
+		quota:     quotaProvider,
+		quotaPage: quotapage.New(quotaProvider),
 	}
 	return pluginapi.Plugin{
 		Metadata: pluginapi.Metadata{
@@ -126,10 +130,30 @@ func (p *MirasimPlugin) ExecuteCommandLine(ctx context.Context, req pluginapi.Co
 }
 
 func (p *MirasimPlugin) RegisterManagement(ctx context.Context, req pluginapi.ManagementRegistrationRequest) (pluginapi.ManagementRegistrationResponse, error) {
-	return p.auth.RegisterManagement(ctx, req)
+	registered, errRegister := p.auth.RegisterManagement(ctx, req)
+	if errRegister != nil {
+		return registered, errRegister
+	}
+	// Append rather than replace: the OAuth provider owns the login resources,
+	// and this page is the only one that carries a menu label for the panel.
+	registered.Resources = append(registered.Resources, p.quotaPage.Resource())
+	return registered, nil
 }
 
 func (p *MirasimPlugin) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
+	return p.HandleManagementWithHost(ctx, req, nil)
+}
+
+// HandleManagementWithHost is what the ABI bridge calls. The host attaches a
+// host_callback_id to every management and resource request, but the SDK's
+// ManagementHandler signature has no parameter for it, so the bridge decodes
+// it and hands the callbacks in here; the quota page can only reach the
+// credential list, a credential's stored JSON and the host HTTP client through
+// them.
+func (p *MirasimPlugin) HandleManagementWithHost(ctx context.Context, req pluginapi.ManagementRequest, host quotapage.HostServices) (pluginapi.ManagementResponse, error) {
+	if p.quotaPage != nil && p.quotaPage.Owns(req.Path) {
+		return p.quotaPage.Serve(ctx, req, host)
+	}
 	return p.auth.HandleManagement(ctx, req)
 }
 
@@ -153,3 +177,4 @@ var _ pluginapi.CommandLinePlugin = (*MirasimPlugin)(nil)
 var _ pluginapi.ManagementAPI = (*MirasimPlugin)(nil)
 var _ pluginapi.ManagementHandler = (*MirasimPlugin)(nil)
 var _ pluginapi.QuotaProvider = (*MirasimPlugin)(nil)
+var _ quotapage.QuotaFetcher = (*quota.Provider)(nil)
