@@ -6,10 +6,13 @@
 // plugin also publishes this page. Only resource routes can be embedded in the
 // panel, and those routes are GET-only and unauthenticated, so the page lives
 // at an unguessable path segment rather than an operator-visible one. The
-// segment is generated once per process start and published through the
+// segment is generated once per process and published through the
 // authenticated plugin list that the panel itself reads, so following it is no
 // easier than reading that list; it does, however, appear in request logs and
-// browser history.
+// browser history. Package scope keeps it stable across the reconfigure CPA
+// runs when it applies a config, so a save does not move the URL out from
+// under an open panel iframe; only a real plugin reload, a new process,
+// changes it.
 package quotapage
 
 import (
@@ -50,16 +53,22 @@ type HostServices interface {
 	HTTPClient() pluginapi.HostHTTPClient
 }
 
-// Page is one process's quota page. The segment is generated at construction
-// and never changes until the plugin is reloaded, so the URL the panel shows
-// stays stable for as long as the route registration that exposed it.
+// Page is a quota page of one process. Every Page built in that process
+// shares processSegment, so the URL the panel embeds survives the reconfigure
+// CPA runs on each config apply; only a real plugin reload, a new process,
+// changes it.
 type Page struct {
 	fetcher QuotaFetcher
 	segment string
 }
 
+// processSegment is generated once for the process, not once per Page: CPA
+// re-runs plugin.Build on every config apply, and a segment generated there
+// would move the page's URL out from under a panel iframe that is already open.
+var processSegment = strings.ToLower(rand.Text())
+
 func New(fetcher QuotaFetcher) *Page {
-	return &Page{fetcher: fetcher, segment: strings.ToLower(rand.Text())}
+	return &Page{fetcher: fetcher, segment: processSegment}
 }
 
 // Resource is the route declaration the host turns into a menu entry. The path
@@ -72,18 +81,19 @@ func (p *Page) Resource() pluginapi.ResourceRoute {
 	}
 }
 
-// Owns reports whether path addresses this page's segment. It compares the
-// last segment in constant time: the route is unauthenticated, so the segment
-// is the only thing keeping an unrelated browser from reading the page.
+// Owns reports whether path addresses this page's route. Only a path under
+// the /quota/ prefix whose final segment is the secret is claimed, not any
+// path that happens to end in the secret; the segment is compared in constant
+// time because it is the access control for an unauthenticated route.
 func (p *Page) Owns(path string) bool {
 	if p == nil || p.segment == "" {
 		return false
 	}
-	idx := strings.LastIndexByte(path, '/')
+	idx := strings.LastIndex(path, routePrefix)
 	if idx < 0 {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(path[idx+1:]), []byte(p.segment)) == 1
+	return subtle.ConstantTimeCompare([]byte(path[idx+len(routePrefix):]), []byte(p.segment)) == 1
 }
 
 // Serve renders the quota page. Reading limits needs the host callbacks, so a

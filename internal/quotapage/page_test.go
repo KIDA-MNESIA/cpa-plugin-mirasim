@@ -83,7 +83,7 @@ func mustServe(t *testing.T, page *Page, req pluginapi.ManagementRequest, host H
 	return resp
 }
 
-func TestResourceIsAMenuRouteWithAnUnpredictableSegment(t *testing.T) {
+func TestResourceIsAMenuRouteWithAStableUnpredictableSegment(t *testing.T) {
 	first := New(&fakeFetcher{})
 	second := New(&fakeFetcher{})
 
@@ -103,14 +103,17 @@ func TestResourceIsAMenuRouteWithAnUnpredictableSegment(t *testing.T) {
 	if len(segment) < 16 {
 		t.Fatalf("segment = %q, want at least 16 characters", segment)
 	}
-	if second.Resource().Path == route.Path {
-		t.Fatalf("two pages share the segment %q", segment)
+	// A config apply re-runs plugin.Build; the URL a panel may already have
+	// open must not move, so every page in the process shares one segment.
+	if second.Resource().Path != route.Path {
+		t.Fatalf("pages in one process disagree on the segment: %q vs %q", route.Path, second.Resource().Path)
 	}
 }
 
 func TestOwnsMatchesOnlyItsOwnSegment(t *testing.T) {
 	page := New(&fakeFetcher{})
 	path := quotaPageURL(page)
+	secret := strings.TrimPrefix(page.Resource().Path, routePrefix)
 
 	cases := []struct {
 		name string
@@ -120,8 +123,10 @@ func TestOwnsMatchesOnlyItsOwnSegment(t *testing.T) {
 		{"own path", path, true},
 		{"login resource", testBasePath + "/oauth/start", false},
 		{"other segment", testBasePath + "/quota/other", false},
+		{"secret behind another prefix", testBasePath + "/oauth/" + secret, false},
 		{"trailing slash", path + "/", false},
-		{"bare segment without prefix", strings.TrimPrefix(path, testBasePath+"/quota/"), false},
+		{"extra segment after the secret", path + "/extra", false},
+		{"bare segment without prefix", secret, false},
 		{"empty", "", false},
 		{"root", "/", false},
 	}

@@ -136,7 +136,11 @@ func (p *MirasimPlugin) RegisterManagement(ctx context.Context, req pluginapi.Ma
 	}
 	// Append rather than replace: the OAuth provider owns the login resources,
 	// and this page is the only one that carries a menu label for the panel.
-	registered.Resources = append(registered.Resources, p.quotaPage.Resource())
+	quotaRoute := p.quotaPage.Resource()
+	// The host drops a resource route with no handler (normalizeResourceRoute),
+	// so set it here the way the OAuth provider sets it on its own routes.
+	quotaRoute.Handler = p
+	registered.Resources = append(registered.Resources, quotaRoute)
 	return registered, nil
 }
 
