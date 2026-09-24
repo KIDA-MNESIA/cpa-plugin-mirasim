@@ -22,6 +22,36 @@ func TestParseRosterDropsPaidVariants(t *testing.T) {
 	}
 }
 
+func TestParseRosterMergesTopLevelModelsAndNewAgents(t *testing.T) {
+	roster, err := parseRoster([]byte(`{"version":"v3","agents":{"claude":[{"id":"claude-sonnet-5","contextWindow":1000000,"label":"Agent Sonnet"}],"dsh":[{"id":"deepseek-flash","contextWindow":1000000,"effort":["off","high"]}],"kimi":[{"id":"kimi-code/k3","contextWindow":1048576}]},"models":{"claude-sonnet-5":{"label":"Model Sonnet","maxOutput":64000,"effort":["low","high"],"adaptive":true},"deepseek-flash":{"maxOutput":384000},"glm-5.3-flash":{"label":"GLM Flash","contextWindow":900000,"effort":["low","high","max"]},"invalid":{"effort":[false,9]}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sonnet, ok := roster.Spec("claude-sonnet-5")
+	if !ok || sonnet.Label != "Agent Sonnet" || sonnet.ContextWindow != 1000000 || sonnet.MaxOutput != 64000 || !sonnet.Adaptive || len(sonnet.Effort) != 2 {
+		t.Fatalf("merged Sonnet = %#v", sonnet)
+	}
+	deepseek, ok := roster.Spec("deepseek-flash")
+	if !ok || deepseek.MaxOutput != 384000 || len(deepseek.Effort) != 2 || deepseek.Effort[0] != "off" {
+		t.Fatalf("merged DeepSeek = %#v", deepseek)
+	}
+	if _, ok := roster.Spec("kimi-k3"); !ok {
+		t.Fatal("official Kimi agent alias was ignored")
+	}
+	glm, ok := roster.Spec("glm-5.3-flash")
+	if !ok || glm.ContextWindow != 900000 || glm.Label != "GLM Flash" {
+		t.Fatalf("top-level GLM = %#v", glm)
+	}
+	if _, ok := roster.Spec("invalid"); ok {
+		t.Fatal("invalid top-level spec was accepted")
+	}
+	clone := roster.Clone()
+	clone.Models["glm-5.3-flash"] = ModelSpec{}
+	if original, _ := roster.Spec("glm-5.3-flash"); original.ContextWindow != 900000 {
+		t.Fatal("roster clone mutated source models")
+	}
+}
+
 func TestRosterCacheFallbackAndIsolation(t *testing.T) {
 	storage, pub, _ := newTestStorage(t, futureJWT())
 	client := NewClient(storage)

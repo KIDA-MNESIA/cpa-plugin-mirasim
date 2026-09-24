@@ -33,3 +33,21 @@ func TestRosterPublishesOnlyTheThinkingFormTheModelAccepts(t *testing.T) {
 		t.Fatalf("adaptive model published a token budget: %+v", models[1].Thinking)
 	}
 }
+
+func TestTopLevelRosterSpecEnrichesCatalogOnlyModels(t *testing.T) {
+	models := exposedModels([]mirasim.RemoteModel{{ID: "glm-5.3-flash"}, {ID: "deepseek-flash"}, {ID: "claude-sonnet-5"}})
+	applyRoster(models, mirasim.ModelRoster{Version: "live", Models: map[string]mirasim.ModelSpec{
+		"glm-5.3-flash":   {ID: "glm-5.3-flash", Label: "GLM Live", ContextWindow: 900000, MaxOutput: 75000, Effort: []string{"low", "high", "max"}},
+		"deepseek-flash":  {ID: "deepseek-flash", MaxOutput: 380000, Effort: []string{"off", "high"}},
+		"claude-sonnet-5": {ID: "claude-sonnet-5", Label: "Sonnet Live", MaxOutput: 64000},
+	}})
+	if models[0].DisplayName != "GLM Live" || models[0].ContextLength != 900000 || models[0].MaxCompletionTokens != 75000 || len(models[0].Thinking.Levels) != 3 {
+		t.Fatalf("top-level GLM spec = %#v", models[0])
+	}
+	if models[1].MaxCompletionTokens != 380000 || len(models[1].Thinking.Levels) != 2 || models[1].Thinking.Levels[0] != "off" {
+		t.Fatalf("top-level DeepSeek spec = %#v", models[1])
+	}
+	if models[2].DisplayName != "Sonnet Live" || models[2].MaxCompletionTokens != 64000 || models[2].Thinking.Min != 0 {
+		t.Fatalf("top-level Sonnet spec = %#v", models[2])
+	}
+}

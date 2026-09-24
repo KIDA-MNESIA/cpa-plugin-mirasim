@@ -8,20 +8,16 @@ import (
 
 // Overlay specifications only on models the account's live catalog exposes.
 func applyRoster(models []pluginapi.ModelInfo, roster mirasim.ModelRoster) {
-	specs := map[string]mirasim.ModelSpec{}
-	for _, entries := range roster.Agents {
-		for _, spec := range entries {
-			specs[spec.ID] = spec
-		}
-	}
 	for i := range models {
 		m := &models[i]
-		spec, ok := specs[strings.ToLower(m.ID)]
+		spec, ok := roster.Spec(m.ID)
 		if !ok {
 			continue
 		}
-		m.ContextLength = spec.ContextWindow
-		m.InputTokenLimit = spec.ContextWindow
+		if spec.ContextWindow > 0 {
+			m.ContextLength = spec.ContextWindow
+			m.InputTokenLimit = spec.ContextWindow
+		}
 		if spec.MaxOutput > 0 {
 			m.MaxCompletionTokens = spec.MaxOutput
 			m.OutputTokenLimit = spec.MaxOutput
@@ -35,12 +31,9 @@ func applyRoster(models []pluginapi.ModelInfo, roster mirasim.ModelRoster) {
 		seen := map[string]bool{}
 		for _, level := range spec.Effort {
 			level = strings.ToLower(strings.TrimSpace(level))
-			switch level {
-			case "low", "medium", "high", "xhigh", "max", "ultra":
-				if !seen[level] {
-					levels = append(levels, level)
-					seen[level] = true
-				}
+			if rosterEffortSupported(m.Type, level) && !seen[level] {
+				levels = append(levels, level)
+				seen[level] = true
 			}
 		}
 		_, known := modelDefinitions[strings.ToLower(m.ID)]
@@ -48,7 +41,7 @@ func applyRoster(models []pluginapi.ModelInfo, roster mirasim.ModelRoster) {
 		// thinking form, so publish the bounds that form actually accepts: an
 		// effort string carries no token budget, and a budget model cannot take
 		// an effort string. Advertising both invites a request the relay rejects.
-		if m.Type == "claude" && known {
+		if m.Type == "claude" && known && (spec.AdaptiveSet || hasAgentSpec(roster, m.ID)) {
 			if spec.Adaptive {
 				if m.Thinking == nil {
 					m.Thinking = adaptiveRelayThinking()
@@ -72,6 +65,33 @@ func applyRoster(models []pluginapi.ModelInfo, roster mirasim.ModelRoster) {
 			m.SupportedParameters = appendUnique(m.SupportedParameters, "thinking")
 		}
 	}
+}
+
+func rosterEffortSupported(modelType, level string) bool {
+	switch modelType {
+	case "deepseek":
+		return level == "off" || level == "low" || level == "high" || level == "max"
+	case "glm", "kimi":
+		return level == "low" || level == "high" || level == "max"
+	default:
+		switch level {
+		case "low", "medium", "high", "xhigh", "max", "ultra":
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+func hasAgentSpec(roster mirasim.ModelRoster, id string) bool {
+	for _, entries := range roster.Agents {
+		for _, spec := range entries {
+			if strings.EqualFold(spec.ID, id) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func appendUnique(values []string, extra ...string) []string {
