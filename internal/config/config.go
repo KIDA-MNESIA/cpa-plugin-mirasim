@@ -28,10 +28,10 @@ type Settings struct {
 	// OAuthLoginProvider names the Mirasim sign-in provider used for browser login
 	// when the caller does not request one.
 	OAuthLoginProvider string `yaml:"oauth-login-provider"`
-	// OAuthCallbackPort pins the loopback port that receives the Mirasim OAuth
-	// callback, so a remote deployment can reach it over an SSH tunnel. Empty or
-	// out of range takes an ephemeral port. Held as text because YAML may quote it
-	// and the environment override is text either way.
+	// OAuthCallbackPort pins the loopback port that receives the --mirasim-login
+	// callback. Management Center logins return through CPA's own port and never
+	// use it. Empty or out of range takes an ephemeral port. Held as text because
+	// YAML may quote it and the environment override is text either way.
 	OAuthCallbackPort string `yaml:"oauth-callback-port"`
 	// HTTP1Only asks the host transport to skip HTTP/2 negotiation for relay
 	// calls. On by default: the official client offers only http/1.1 in its TLS
@@ -51,14 +51,17 @@ type rootConfig struct {
 }
 
 // deprecatedKeys names configuration keys that have been removed, each paired
-// with the setting that supersedes it. Nothing reads these keys: they carry no
+// with the setting that supersedes it, or with nothing when the key simply has
+// to go. Nothing reads these keys: they carry no
 // yaml tag on Settings and no environment binding, and they are listed here
 // only so that a configuration still carrying one can be reported to the
 // operator. CPA does not check plugin configuration keys against the fields a
 // plugin declares and YAML ignores a key nothing reads, so without this table a
 // stale configuration loads silently.
 var deprecatedKeys = []struct{ key, replacement string }{
-	{"oauth-public-base-url", "oauth-callback-port"},
+	// The browser callback returns through CPA's own port again, as it did by
+	// default when this key was introduced, so nothing takes its place.
+	{"oauth-public-base-url", ""},
 }
 
 // DeprecatedKeys reports which removed keys a configuration still carries, in a
@@ -83,8 +86,8 @@ func DeprecatedKeys(raw []byte) []string {
 	return found
 }
 
-// ReplacementFor names the setting that supersedes a removed key. Every key
-// DeprecatedKeys returns has one, because both come from the same table.
+// ReplacementFor names the setting that supersedes a removed key, or returns
+// empty when the key has none and only needs deleting.
 func ReplacementFor(key string) string {
 	for _, deprecated := range deprecatedKeys {
 		if deprecated.key == key {

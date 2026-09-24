@@ -136,8 +136,8 @@ plugins:
 	if port := Parse(hosted).OAuthCallbackPort; port != "41111" {
 		t.Fatalf("OAuthCallbackPort = %q", port)
 	}
-	if replacement := ReplacementFor("oauth-public-base-url"); replacement != "oauth-callback-port" {
-		t.Fatalf("ReplacementFor = %q", replacement)
+	if replacement := ReplacementFor("oauth-public-base-url"); replacement != "" {
+		t.Fatalf("ReplacementFor = %q, want none", replacement)
 	}
 }
 

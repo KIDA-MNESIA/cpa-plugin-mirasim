@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -26,9 +27,13 @@ const (
 	// cliLoginTTL bounds the blocking --mirasim-login wait, which is interactive
 	// and additionally offers a manual paste prompt after a few seconds.
 	cliLoginTTL = 3 * time.Minute
-	// maxOAuthSessions is small because every pending browser login holds a
-	// loopback port open until it completes or expires.
-	maxOAuthSessions = 4
+	// maxOAuthSessions bounds the pending browser logins kept in memory. Nothing
+	// tells the plugin when Management Center abandons a login, so the oldest one
+	// is dropped to make room rather than refusing the next.
+	maxOAuthSessions = 8
+	// OAuthCallbackResource is the resource route, under the plugin's resource
+	// prefix on CPA's own port, that receives the Mirasim browser callback.
+	OAuthCallbackResource = "/oauth/callback"
 	// fallbackLoginProvider is the last resort when neither the caller nor the
 	// configuration names a Mirasim sign-in provider.
 	fallbackLoginProvider = "github"
@@ -37,8 +42,6 @@ const (
 type oauthSession struct {
 	state        string
 	provider     string
-	capture      *loopbackCapture
-	teardown     *time.Timer
 	expiresAt    time.Time
 	accessToken  string
 	refreshToken string
@@ -52,25 +55,70 @@ type oauthCoordinator struct {
 	mu       sync.Mutex
 	sessions map[string]*oauthSession
 	now      func() time.Time
+	// resourceBasePath is the plugin resource prefix CPA reported when it
+	// registered the callback route.
+	resourceBasePath string
 }
 
 func newOAuthCoordinator() *oauthCoordinator {
 	return &oauthCoordinator{sessions: make(map[string]*oauthSession), now: time.Now}
 }
 
+// RegisterManagement mounts the one browser-facing route this plugin owns: the
+// OAuth callback, served on CPA's own port under the plugin resource prefix.
+//
+// Mirasim only redirects to a loopback address, so the browser always lands on
+// 127.0.0.1 of its own machine. Serving the callback on CPA's port rather than
+// on a listener of the plugin's own is what lets it arrive wherever that port
+// is already reachable: a host-local CPA, a published Docker port, or an SSH
+// tunnel to CPA. Where it is not, the operator can replace 127.0.0.1:<port> in
+// the refused URL with the address Management Center is opened on.
+func (p *Provider) RegisterManagement(_ context.Context, req pluginapi.ManagementRegistrationRequest) (pluginapi.ManagementRegistrationResponse, error) {
+	p.oauth.mu.Lock()
+	p.oauth.resourceBasePath = strings.TrimRight(strings.TrimSpace(req.ResourceBasePath), "/")
+	p.oauth.mu.Unlock()
+	return pluginapi.ManagementRegistrationResponse{Resources: []pluginapi.ResourceRoute{
+		{Path: OAuthCallbackResource, Description: "Receives a Mirasim browser OAuth callback.", Handler: p},
+	}}, nil
+}
+
+// HandleManagement serves the OAuth callback resource. CPA does not
+// authenticate resource routes, so the callback is accepted only when its state
+// names a pending login, only once, and no response ever reflects a credential
+// or any part of one.
+func (p *Provider) HandleManagement(_ context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
+	p.oauth.mu.Lock()
+	callbackPath := p.oauth.resourceBasePath + OAuthCallbackResource
+	p.oauth.mu.Unlock()
+	if !strings.EqualFold(req.Method, http.MethodGet) || req.Path != callbackPath {
+		return callbackPageResponse(http.StatusNotFound, callbackNotFoundPage), nil
+	}
+	status, page := p.oauth.acceptCallback(oauthResultFromValues(req.Query))
+	return callbackPageResponse(status, page), nil
+}
+
 // StartLogin drives CPA's native plugin login abstraction: the host registers the
 // returned State, the browser follows the returned Mirasim authorize URL, and the
-// callback lands on a loopback listener this plugin owns. No HTTP route is
-// registered with the host on any prefix.
+// callback returns to the resource route registered above.
 func (p *Provider) StartLogin(ctx context.Context, req pluginapi.AuthLoginStartRequest) (pluginapi.AuthLoginStartResponse, error) {
 	if provider := strings.TrimSpace(req.Provider); provider != "" && !strings.EqualFold(provider, credentials.Provider) {
 		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("unsupported OAuth provider %q", provider)
 	}
-	// req.BaseURL is deliberately ignored. It points at CPA's
-	// /v0/management/oauth-callback, which hard-rejects any callback without an
-	// OAuth `code` and persists only {code,state,error}; Mirasim returns
-	// access_token and refresh_token instead. PollLogin likewise only ever sees
-	// the static metadata registered here, never callback query data.
+	// req.BaseURL points at CPA's /v0/management/oauth-callback, which
+	// hard-rejects any callback without an OAuth `code` and persists only
+	// {code,state,error}; Mirasim returns access_token and refresh_token instead.
+	// Only its origin is used: CPA always names its own port on 127.0.0.1, which
+	// is the one callback host Mirasim accepts.
+	origin, errOrigin := loginCallbackOrigin(req.BaseURL)
+	if errOrigin != nil {
+		return pluginapi.AuthLoginStartResponse{}, errOrigin
+	}
+	p.oauth.mu.Lock()
+	resourceBasePath := p.oauth.resourceBasePath
+	p.oauth.mu.Unlock()
+	if resourceBasePath == "" {
+		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("Mirasim OAuth callback route is not registered with CPA")
+	}
 	loginProvider, errProvider := resolveLoginProvider(metadataString(req.Metadata, "provider"), p.settings.OAuthLoginProvider)
 	if errProvider != nil {
 		return pluginapi.AuthLoginStartResponse{}, errProvider
@@ -86,57 +134,24 @@ func (p *Provider) StartLogin(ctx context.Context, req pluginapi.AuthLoginStartR
 	if errState != nil {
 		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("generate Mirasim OAuth state: %w", errState)
 	}
-	port := loopbackCallbackPort(p.settings.OAuthCallbackPort)
-
-	now := p.oauth.now()
-	expiresAt := now.Add(oauthLoginTTL)
-	// The session slot is taken under the same lock that checks the cap. Binding
-	// the listener afterwards takes long enough that concurrent StartLogin calls
-	// would otherwise all pass the check before any of them inserted, and the cap
-	// exists because every pending login holds a loopback port open.
-	p.oauth.mu.Lock()
-	stale := p.oauth.purgeLocked(now)
-	if port != 0 {
-		// A pinned port can host exactly one listener, so the newest login wins and
-		// the previous one is closed rather than left to fail the bind below.
-		stale = append(stale, p.oauth.drainLocked()...)
-	} else if len(p.oauth.sessions) >= maxOAuthSessions {
-		p.oauth.mu.Unlock()
-		closeLoopbackCaptures(stale)
-		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("too many pending Mirasim OAuth sessions")
-	}
-	p.oauth.sessions[state] = &oauthSession{state: state, provider: loginProvider, expiresAt: expiresAt}
-	p.oauth.mu.Unlock()
-	closeLoopbackCaptures(stale)
-
-	capture, errCapture := startLoopbackCapture(port, state)
-	if errCapture != nil {
-		p.oauth.expire(state)
-		return pluginapi.AuthLoginStartResponse{}, errCapture
-	}
-	authURL, errURL := buildMirasimOAuthURL(p.settings.AdminURL, loginProvider, capture.CallbackURL(), state)
+	// Mirasim drops the state parameter of its login URL but keeps the query of
+	// redirect_uri and appends the tokens to it, so the state has to travel inside
+	// the callback address to come back at all.
+	callbackURL := *origin
+	callbackURL.Path = resourceBasePath + OAuthCallbackResource
+	callbackURL.RawQuery = url.Values{"state": []string{state}}.Encode()
+	authURL, errURL := buildMirasimOAuthURL(p.settings.AdminURL, loginProvider, callbackURL.String(), state)
 	if errURL != nil {
-		capture.Close()
-		p.oauth.expire(state)
 		return pluginapi.AuthLoginStartResponse{}, errURL
 	}
 
+	now := p.oauth.now()
+	expiresAt := now.Add(oauthLoginTTL)
 	p.oauth.mu.Lock()
-	session := p.oauth.sessions[state]
-	if session == nil {
-		// Another login claimed the pinned port, or the slot expired, while this
-		// listener was coming up.
-		p.oauth.mu.Unlock()
-		capture.Close()
-		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("Mirasim OAuth session was replaced before it could start")
-	}
-	session.capture = capture
-	// An abandoned login must release its port on its own rather than squatting
-	// until some later call happens to purge it.
-	session.teardown = time.AfterFunc(oauthLoginTTL, func() { p.oauth.expire(state) })
+	p.oauth.purgeLocked(now)
+	p.oauth.makeRoomLocked()
+	p.oauth.sessions[state] = &oauthSession{state: state, provider: loginProvider, expiresAt: expiresAt}
 	p.oauth.mu.Unlock()
-
-	go p.awaitOAuthCallback(state, capture)
 
 	return pluginapi.AuthLoginStartResponse{
 		Provider:  credentials.Provider,
@@ -154,11 +169,9 @@ func (p *Provider) StartLogin(ctx context.Context, req pluginapi.AuthLoginStartR
 func (p *Provider) PollLogin(ctx context.Context, req pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
 	state := strings.TrimSpace(req.State)
 	now := p.oauth.now()
-	var stale []*loopbackCapture
-	defer func() { closeLoopbackCaptures(stale) }()
 
 	p.oauth.mu.Lock()
-	stale = p.oauth.purgeLocked(now)
+	p.oauth.purgeLocked(now)
 	session := p.oauth.sessions[state]
 	if session == nil || !constantTimeEqual(session.state, state) {
 		p.oauth.mu.Unlock()
@@ -204,85 +217,81 @@ func (p *Provider) PollLogin(ctx context.Context, req pluginapi.AuthLoginPollReq
 	return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Message: "Mirasim OAuth login completed", Auth: auth, Auths: []pluginapi.AuthData{auth}}, nil
 }
 
-// awaitOAuthCallback moves the one captured callback into session state and then
-// releases the port immediately, instead of holding it until the next poll.
-func (p *Provider) awaitOAuthCallback(state string, capture *loopbackCapture) {
-	select {
-	case result := <-capture.Results():
-		p.oauth.recordCallback(state, result)
-	case <-capture.Done():
-	}
-	capture.Close()
-}
-
-// recordCallback latches the single callback outcome. Rejection messages describe
+// acceptCallback latches the single callback of the pending login its state
+// names and picks the page the browser is shown. Rejection messages describe
 // only the shape of the failure, never any captured value.
-func (c *oauthCoordinator) recordCallback(state string, result localOAuthResult) {
+func (c *oauthCoordinator) acceptCallback(result localOAuthResult) (int, string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	session := c.sessions[state]
-	if session == nil || session.callbackDone || session.auth != nil {
-		return
+	c.purgeLocked(c.now())
+	session := c.sessions[result.state]
+	if result.state == "" || session == nil || !constantTimeEqual(session.state, result.state) {
+		return http.StatusBadRequest, callbackStatePage
+	}
+	if session.callbackDone || session.auth != nil {
+		return http.StatusConflict, callbackUsedPage
 	}
 	session.callbackDone = true
 	switch {
-	case !constantTimeEqual(session.state, strings.TrimSpace(result.state)):
-		session.errorMessage = "Mirasim OAuth callback state did not match"
 	case result.errorMessage != "":
-		// The listener only ever produces fixed messages describing the shape of the
-		// failure, never a captured value, so this is safe to surface verbatim.
+		// oauthResultFromValues only ever produces a fixed message, never a
+		// captured value, so this is safe to surface verbatim.
 		session.errorMessage = "Mirasim OAuth login failed: " + result.errorMessage
-	case result.accessToken == "" || result.refreshToken == "":
-		session.errorMessage = "Mirasim OAuth callback did not include renewable credentials"
 	default:
+		if rejection := rejectCallbackCredentials(result); rejection != "" {
+			session.errorMessage = "Mirasim OAuth login failed: " + rejection
+			break
+		}
 		session.accessToken = result.accessToken
 		session.refreshToken = result.refreshToken
+		return http.StatusOK, callbackCompletePage
 	}
+	return http.StatusBadRequest, callbackFailedPage
 }
 
-// expire drops an abandoned login and frees its loopback port.
-func (c *oauthCoordinator) expire(state string) {
-	c.mu.Lock()
-	stale := c.removeLocked(state)
-	c.mu.Unlock()
-	closeLoopbackCaptures(stale)
-}
-
-// purgeLocked removes every expired session and returns the listeners its callers
-// must close once they have released the mutex.
-func (c *oauthCoordinator) purgeLocked(now time.Time) []*loopbackCapture {
-	var stale []*loopbackCapture
+// purgeLocked removes every expired session.
+func (c *oauthCoordinator) purgeLocked(now time.Time) {
 	for state, session := range c.sessions {
 		if session == nil || !now.Before(session.expiresAt) {
-			stale = append(stale, c.removeLocked(state)...)
+			c.removeLocked(state)
 		}
 	}
-	return stale
 }
 
-func (c *oauthCoordinator) drainLocked() []*loopbackCapture {
-	var stale []*loopbackCapture
-	for state := range c.sessions {
-		stale = append(stale, c.removeLocked(state)...)
+// makeRoomLocked drops the oldest pending logins until one more fits.
+func (c *oauthCoordinator) makeRoomLocked() {
+	for len(c.sessions) >= maxOAuthSessions {
+		oldest := ""
+		for state, session := range c.sessions {
+			if oldest == "" || session.expiresAt.Before(c.sessions[oldest].expiresAt) {
+				oldest = state
+			}
+		}
+		c.removeLocked(oldest)
 	}
-	return stale
 }
 
-func (c *oauthCoordinator) removeLocked(state string) []*loopbackCapture {
+func (c *oauthCoordinator) removeLocked(state string) {
 	session := c.sessions[state]
 	delete(c.sessions, state)
-	if session == nil {
-		return nil
+	if session != nil {
+		session.accessToken = ""
+		session.refreshToken = ""
 	}
-	session.accessToken = ""
-	session.refreshToken = ""
-	if session.teardown != nil {
-		session.teardown.Stop()
+}
+
+// loginCallbackOrigin reduces the host's callback base URL to the origin the
+// Mirasim callback returns to. Mirasim refuses any redirect_uri that is not
+// loopback, so a non-loopback origin is refused here with a clearer message.
+func loginCallbackOrigin(baseURL string) (*url.URL, error) {
+	parsed, errParse := url.Parse(strings.TrimSpace(baseURL))
+	if errParse != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return nil, fmt.Errorf("CPA did not supply a usable OAuth callback address")
 	}
-	if session.capture == nil {
-		return nil
+	if !isLoopbackHost(parsed.Hostname()) {
+		return nil, fmt.Errorf("CPA OAuth callback address is not loopback, which Mirasim refuses")
 	}
-	return []*loopbackCapture{session.capture}
+	return &url.URL{Scheme: parsed.Scheme, Host: parsed.Host}, nil
 }
 
 // resolveLoginProvider takes the first named candidate in precedence order and

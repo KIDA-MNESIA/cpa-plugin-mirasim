@@ -28,16 +28,15 @@ func TestDiscoveredProvidersControlWhichLoginsMayStart(t *testing.T) {
 	settings := pluginconfig.Defaults()
 	settings.AdminURL = server.URL
 	p := New(settings, mirasim.NewPool())
-	t.Cleanup(func() { releaseLoginSessions(p) })
+	if _, errRegister := p.RegisterManagement(context.Background(), pluginapi.ManagementRegistrationRequest{ResourceBasePath: testResourceBasePath}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
 
 	start := func(provider string) (pluginapi.AuthLoginStartResponse, error) {
-		// BaseURL is CPA's own /v0/management/oauth-callback. It is passed here to
-		// prove the plugin ignores it and never routes the callback through the host.
-		req := pluginapi.AuthLoginStartRequest{BaseURL: "http://127.0.0.1:8317/v0/management/oauth-callback"}
 		if provider != "" {
-			req.Metadata = map[string]any{"provider": provider}
+			return p.StartLogin(context.Background(), startRequest(map[string]any{"provider": provider}))
 		}
-		return p.StartLogin(context.Background(), req)
+		return p.StartLogin(context.Background(), startRequest())
 	}
 
 	started, errStarted := start("gitlab")

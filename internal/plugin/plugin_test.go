@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"context"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -15,10 +16,13 @@ func TestBuildDeclaresProviderCapabilities(t *testing.T) {
 	if caps.AuthProvider == nil || caps.ModelProvider == nil || caps.Executor == nil || caps.ThinkingApplier == nil || caps.CommandLinePlugin == nil || caps.QuotaProvider == nil {
 		t.Fatalf("capabilities are incomplete: %#v", caps)
 	}
-	// The plugin owns no HTTP route surface: claiming the Management API is what
-	// put routes under the unauthenticated static-asset prefix the store rejects.
-	if caps.ManagementAPI != nil {
-		t.Fatalf("plugin still claims the Management API: %#v", caps.ManagementAPI)
+	// The Management API capability carries the one OAuth callback resource.
+	if caps.ManagementAPI == nil {
+		t.Fatal("plugin does not register its OAuth callback resource")
+	}
+	registered, errRegister := caps.ManagementAPI.RegisterManagement(context.Background(), pluginapi.ManagementRegistrationRequest{ResourceBasePath: "/v0/resource/plugins/mirasim"})
+	if errRegister != nil || len(registered.Routes) != 0 || len(registered.Resources) != 1 {
+		t.Fatalf("management registration = %#v, error = %v", registered, errRegister)
 	}
 	if caps.ExecutorModelScope != pluginapi.ExecutorModelScopeOAuth {
 		t.Fatalf("executor scope = %q", caps.ExecutorModelScope)

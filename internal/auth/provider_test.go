@@ -179,7 +179,7 @@ func TestLocalOAuthHandlerBindsMissingStateToRandomLoopbackPath(t *testing.T) {
 // it had started. Here the count of live goroutines must be the same after six
 // abandoned logins as it was after the first.
 func TestRepeatedManualPromptsDoNotAccumulateGoroutines(t *testing.T) {
-	provider, _ := newLoopbackLoginProvider(t, pluginconfig.Defaults())
+	provider, _ := newLoginProvider(t, pluginconfig.Defaults())
 	source := newScriptedStdin()
 	provider.prompter = newStdinPrompter(source)
 	// Retire the reader with the test rather than leaving it parked for the rest
@@ -233,7 +233,7 @@ func TestRepeatedManualPromptsDoNotAccumulateGoroutines(t *testing.T) {
 // channel and the following login sat waiting for a second one, with no way for
 // the operator to tell the line had been eaten rather than rejected.
 func TestLineTypedAfterACancelledLoginGoesToTheNextLogin(t *testing.T) {
-	provider, _ := newLoopbackLoginProvider(t, pluginconfig.Defaults())
+	provider, _ := newLoginProvider(t, pluginconfig.Defaults())
 	source := newScriptedStdin()
 	provider.prompter = newStdinPrompter(source)
 	t.Cleanup(func() {
@@ -291,7 +291,7 @@ func TestLineTypedAfterACancelledLoginGoesToTheNextLogin(t *testing.T) {
 // question it was never meant for, the sign-in fails on a code it never saw, and
 // the line is gone either way. The email prompt must go back to stdin instead.
 func TestACallbackURLTypedForACancelledLoginIsNotHandedToAnEmailCodePrompt(t *testing.T) {
-	provider, _ := newLoopbackLoginProvider(t, pluginconfig.Defaults())
+	provider, _ := newLoginProvider(t, pluginconfig.Defaults())
 	source := newScriptedStdin()
 	provider.prompter = newStdinPrompter(source)
 	t.Cleanup(func() {

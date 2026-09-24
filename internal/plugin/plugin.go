@@ -51,7 +51,7 @@ func Build(configYAML []byte) pluginapi.Plugin {
 				{Name: "admin-url", Type: pluginapi.ConfigFieldTypeString, Description: "Mirasim authentication service base URL."},
 				{Name: "client-version", Type: pluginapi.ConfigFieldTypeString, Description: "Value sent in x-mirasim-client."},
 				{Name: "oauth-login-provider", Type: pluginapi.ConfigFieldTypeString, Description: "Mirasim sign-in provider used for browser login when the request names none. Defaults to github."},
-				{Name: "oauth-callback-port", Type: pluginapi.ConfigFieldTypeInteger, Description: "Fixed 127.0.0.1 port for the Mirasim OAuth callback, so a remote host can be reached over an SSH tunnel. Unset takes an ephemeral port."},
+				{Name: "oauth-callback-port", Type: pluginapi.ConfigFieldTypeInteger, Description: "Fixed 127.0.0.1 port for the --mirasim-login callback. Management Center logins return through CPA's own port instead. Unset takes an ephemeral port."},
 				{Name: "http1-only", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Skip HTTP/2 negotiation on Mirasim relay calls."},
 				{Name: "lowercase-relay-headers", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Send Mirasim relay header names in lower case. Implies HTTP/1.1."},
 			},
@@ -65,6 +65,7 @@ func Build(configYAML []byte) pluginapi.Plugin {
 			ExecutorOutputFormats: append([]string(nil), executor.SupportedFormats...),
 			ThinkingApplier:       p,
 			CommandLinePlugin:     p,
+			ManagementAPI:         p,
 			QuotaProvider:         p,
 		},
 	}
@@ -124,6 +125,14 @@ func (p *MirasimPlugin) ExecuteCommandLine(ctx context.Context, req pluginapi.Co
 	return p.auth.ExecuteCommandLine(ctx, req)
 }
 
+func (p *MirasimPlugin) RegisterManagement(ctx context.Context, req pluginapi.ManagementRegistrationRequest) (pluginapi.ManagementRegistrationResponse, error) {
+	return p.auth.RegisterManagement(ctx, req)
+}
+
+func (p *MirasimPlugin) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
+	return p.auth.HandleManagement(ctx, req)
+}
+
 func (p *MirasimPlugin) DescribeQuota(ctx context.Context, req pluginapi.QuotaDescribeRequest) (pluginapi.QuotaDescribeResponse, error) {
 	return p.quota.DescribeQuota(ctx, req)
 }
@@ -141,4 +150,6 @@ var _ pluginapi.ModelProvider = (*MirasimPlugin)(nil)
 var _ pluginapi.ProviderExecutor = (*MirasimPlugin)(nil)
 var _ pluginapi.ThinkingApplier = (*MirasimPlugin)(nil)
 var _ pluginapi.CommandLinePlugin = (*MirasimPlugin)(nil)
+var _ pluginapi.ManagementAPI = (*MirasimPlugin)(nil)
+var _ pluginapi.ManagementHandler = (*MirasimPlugin)(nil)
 var _ pluginapi.QuotaProvider = (*MirasimPlugin)(nil)

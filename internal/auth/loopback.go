@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 const (
@@ -30,14 +32,12 @@ type localOAuthResult struct {
 }
 
 // loopbackCapture owns a single-use HTTP listener bound to 127.0.0.1 that
-// receives exactly one Mirasim OAuth callback.
+// receives exactly one Mirasim OAuth callback for --mirasim-login.
 //
-// Mirasim returns access_token and refresh_token directly in the callback query,
-// so the callback can never travel through CPA's /v0/management/oauth-callback
-// endpoint: that endpoint hard-rejects a callback without an OAuth `code` and
-// persists only {code,state,error}. A plugin-owned loopback port is therefore the
-// only place the tokens can be captured, which is also how --mirasim-login and
-// CPA's own built-in Anthropic and Codex logins do it.
+// The CLI login runs in a CPA process that serves no HTTP, so the callback
+// resource on CPA's port is not there to receive it. Management Center logins
+// use that resource instead of a listener like this one, because a listener
+// bound inside a container is unreachable from any browser outside it.
 type loopbackCapture struct {
 	callbackURL string
 	results     chan localOAuthResult
@@ -116,12 +116,6 @@ func (c *loopbackCapture) Close() {
 			_ = c.server.Close()
 		}
 	})
-}
-
-func closeLoopbackCaptures(captures []*loopbackCapture) {
-	for _, capture := range captures {
-		capture.Close()
-	}
 }
 
 // localOAuthHandler serves exactly one callback on callbackPath. That path holds
@@ -212,6 +206,10 @@ func oauthResultFromValues(values url.Values) localOAuthResult {
 	}
 }
 
+func callbackPageResponse(status int, page string) pluginapi.ManagementResponse {
+	return pluginapi.ManagementResponse{StatusCode: status, Headers: browserHeaders(nil), Body: []byte(page)}
+}
+
 func browserHeaders(extra http.Header) http.Header {
 	headers := make(http.Header)
 	for key, values := range extra {
@@ -242,4 +240,7 @@ const (
 
 	callbackUsedPage = callbackPagePrefix + `<title>Callback already used</title></head><body>` +
 		`<h1>This callback was already used</h1><p>Start the login again if you need another sign-in.</p></body></html>`
+
+	callbackNotFoundPage = callbackPagePrefix + `<title>Not found</title></head><body>` +
+		`<h1>Not found</h1><p>This is not a Mirasim sign-in address.</p></body></html>`
 )

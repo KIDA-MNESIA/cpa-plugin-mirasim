@@ -33,10 +33,10 @@ func TestABIRegisterReportsCapabilities(t *testing.T) {
 	if registration.SchemaVersion != pluginabi.SchemaVersion || !registration.Capabilities.Executor || !registration.Capabilities.ThinkingApplier || !registration.Capabilities.QuotaProvider {
 		t.Fatalf("registration = %#v", registration)
 	}
-	// The plugin registers no HTTP routes at all, so the host must never mount
-	// anything for it under the unauthenticated static-asset prefix.
-	if registration.Capabilities.ManagementAPI {
-		t.Fatalf("management_api = true, want false: %#v", registration.Capabilities)
+	// The Management API capability is how the OAuth callback resource reaches
+	// the host.
+	if !registration.Capabilities.ManagementAPI {
+		t.Fatalf("management_api = false, want true: %#v", registration.Capabilities)
 	}
 
 	raw, errThinking := handleABIMethod(context.Background(), pluginabi.MethodThinkingApply, []byte(`{"model":{"ID":"gpt-5.6-sol"},"config":{"Mode":"level","Level":"high"},"body":"e30="}`))
@@ -119,10 +119,7 @@ func TestABIUnknownMethodReturnsErrorEnvelope(t *testing.T) {
 	if _, errRegister := handleABIMethod(context.Background(), pluginabi.MethodPluginRegister, []byte(`{}`)); errRegister != nil {
 		t.Fatal(errRegister)
 	}
-	// The retired management methods must fall through to the same envelope as
-	// any other unknown method: a host that still calls them gets an answer
-	// rather than a crashed plugin.
-	for _, method := range []string{"unknown.method", pluginabi.MethodManagementRegister, pluginabi.MethodManagementHandle} {
+	for _, method := range []string{"unknown.method"} {
 		raw, errCall := handleABIMethod(context.Background(), method, nil)
 		if errCall != nil {
 			t.Fatalf("%s returned transport error: %v", method, errCall)
@@ -134,6 +131,49 @@ func TestABIUnknownMethodReturnsErrorEnvelope(t *testing.T) {
 		if envelope.OK || envelope.Error == nil || envelope.Error.Code != "unknown_method" {
 			t.Fatalf("%s envelope = %s", method, raw)
 		}
+	}
+}
+
+// The host decodes registration into its own RPC shape and routes every
+// resource request back through management.handle, so both have to round-trip
+// through the envelope rather than only through the Go interface.
+func TestABIServesTheOAuthCallbackResource(t *testing.T) {
+	defer MirasimPluginShutdown()
+	if _, errRegister := handleABIMethod(context.Background(), pluginabi.MethodPluginRegister, []byte(`{}`)); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	raw, errCall := handleABIMethod(context.Background(), pluginabi.MethodManagementRegister, []byte(`{"ResourceBasePath":"/v0/resource/plugins/mirasim"}`))
+	if errCall != nil {
+		t.Fatal(errCall)
+	}
+	var envelope pluginabi.Envelope
+	if errDecode := json.Unmarshal(raw, &envelope); errDecode != nil || !envelope.OK {
+		t.Fatalf("management.register envelope = %s, error = %v", raw, errDecode)
+	}
+	var registration struct {
+		Routes    []pluginapi.ManagementRoute `json:"routes,omitempty"`
+		Resources []pluginapi.ResourceRoute   `json:"resources,omitempty"`
+	}
+	if errDecode := json.Unmarshal(envelope.Result, &registration); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if len(registration.Routes) != 0 || len(registration.Resources) != 1 || registration.Resources[0].Path != "/oauth/callback" {
+		t.Fatalf("registration = %#v", registration)
+	}
+
+	raw, errCall = handleABIMethod(context.Background(), pluginabi.MethodManagementHandle, []byte(`{"Method":"GET","Path":"/v0/resource/plugins/mirasim/oauth/callback","Query":{"state":["not-a-session"]},"host_callback_id":"cb-1"}`))
+	if errCall != nil {
+		t.Fatal(errCall)
+	}
+	if errDecode := json.Unmarshal(raw, &envelope); errDecode != nil || !envelope.OK {
+		t.Fatalf("management.handle envelope = %s, error = %v", raw, errDecode)
+	}
+	var page pluginapi.ManagementResponse
+	if errDecode := json.Unmarshal(envelope.Result, &page); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if page.StatusCode != http.StatusBadRequest || !strings.Contains(string(page.Body), "Invalid OAuth state") {
+		t.Fatalf("callback page = %d %s", page.StatusCode, page.Body)
 	}
 }
 
@@ -251,14 +291,15 @@ func TestABIRegisterWarnsOnceAboutADeprecatedConfigKey(t *testing.T) {
 		if line.level != "warn" {
 			t.Fatalf("level = %q, want warn", line.level)
 		}
-		// It must say which key is dead and which setting replaces it.
-		if !strings.Contains(line.message, "oauth-public-base-url") {
-			t.Fatalf("message does not name the dead key: %q", line.message)
+		// It must say which key is dead and that nothing replaces it: pointing at
+		// oauth-callback-port would send the operator to a CLI-only setting.
+		if !strings.Contains(line.message, "oauth-public-base-url") || !strings.Contains(line.message, "delete it") {
+			t.Fatalf("message does not name the dead key and the fix: %q", line.message)
 		}
-		if !strings.Contains(line.message, "oauth-callback-port") {
-			t.Fatalf("message does not name the replacement: %q", line.message)
+		if strings.Contains(line.message, "oauth-callback-port") {
+			t.Fatalf("message names a replacement that does not apply: %q", line.message)
 		}
-		if line.fields["deprecated_key"] != "oauth-public-base-url" || line.fields["replacement"] != "oauth-callback-port" {
+		if _, named := line.fields["replacement"]; line.fields["deprecated_key"] != "oauth-public-base-url" || named {
 			t.Fatalf("fields = %#v", line.fields)
 		}
 		// Key names only. Nothing from the operator's configuration may reach the
