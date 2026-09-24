@@ -820,8 +820,12 @@ func TestEmailSendFailureCannotUnpinAMailedAddress(t *testing.T) {
 // Mirasim, not by the send interval.
 func TestEmailSendFailureCannotUnpinASiblingInFlight(t *testing.T) {
 	provider, fake := newEmailLoginProvider(t)
+	// The held send runs on its own goroutine, so the clock it reads while
+	// finishing has to be guarded rather than a bare captured variable.
+	var clockMu sync.Mutex
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
-	provider.oauth.now = func() time.Time { return now }
+	provider.oauth.now = func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return now }
+	advanceClock := func(d time.Duration) { clockMu.Lock(); now = now.Add(d); clockMu.Unlock() }
 	started, errStart := provider.StartLogin(context.Background(), startRequest())
 	if errStart != nil {
 		t.Fatal(errStart)
@@ -854,7 +858,7 @@ func TestEmailSendFailureCannotUnpinASiblingInFlight(t *testing.T) {
 	// fails after the first has committed its pin.
 	fake.clearHold()
 	fake.failCodeRequests()
-	now = now.Add(emailCodeSendInterval)
+	advanceClock(emailCodeSendInterval)
 	if status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
 		"state":           []string{started.State},
 		emailAddressField: []string{"first@example.com"},
@@ -880,7 +884,7 @@ func TestEmailSendFailureCannotUnpinASiblingInFlight(t *testing.T) {
 		t.Fatalf("after the held send succeeded address = %q, mailed = %v; want the address of the send that mailed", pinned, mailed)
 	}
 	// The surviving pin still refuses an address change.
-	now = now.Add(emailCodeSendInterval)
+	advanceClock(emailCodeSendInterval)
 	status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
 		"state":           []string{started.State},
 		emailAddressField: []string{"attacker@example.com"},
