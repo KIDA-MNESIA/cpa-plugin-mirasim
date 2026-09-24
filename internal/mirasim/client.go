@@ -114,6 +114,8 @@ func (p *Pool) Forget(storage credentials.Storage) {
 
 type Client struct {
 	options         RelayOptions
+	catalogMu       sync.Mutex
+	catalogModels   []RemoteModel
 	rosterMu        sync.Mutex
 	roster          ModelRoster
 	rosterNextCheck time.Time
@@ -392,6 +394,9 @@ func (c *Client) ListModels(ctx context.Context, client pluginapi.HostHTTPClient
 	if errParse != nil {
 		return Catalog{}, errParse
 	}
+	c.catalogMu.Lock()
+	c.catalogModels = append([]RemoteModel(nil), models...)
+	c.catalogMu.Unlock()
 	quota, available := QuotaFromHeaders(resp.Headers, time.Now())
 	if !available {
 		quota = QuotaSnapshot{
@@ -402,6 +407,14 @@ func (c *Client) ListModels(ctx context.Context, client pluginapi.HostHTTPClient
 		}
 	}
 	return Catalog{Models: models, Quota: quota}, nil
+}
+
+// CachedModels retains the last successful catalog for this credential only.
+// It keeps dynamic account models registered during a temporary catalog outage.
+func (c *Client) CachedModels() []RemoteModel {
+	c.catalogMu.Lock()
+	defer c.catalogMu.Unlock()
+	return append([]RemoteModel(nil), c.catalogModels...)
 }
 
 // FetchQuota queries structured limits only. A missing route must never

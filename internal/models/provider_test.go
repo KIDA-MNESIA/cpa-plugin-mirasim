@@ -2,12 +2,106 @@ package models
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	pluginconfig "github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/config"
+	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/credentials"
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/mirasim"
 )
+
+type providerHostClient struct {
+	do func(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error)
+}
+
+func (h providerHostClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	return h.do(ctx, req)
+}
+
+func (providerHostClient) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
+	return pluginapi.HTTPStreamResponse{}, fmt.Errorf("unexpected stream")
+}
+
+func providerTestStorage(t *testing.T) credentials.Storage {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return credentials.Storage{
+		Type: credentials.Provider, AccessToken: "opaque-access-token", RefreshToken: "refresh-token",
+		DevicePrivateKey: strings.TrimSpace(string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))),
+		RelayURL:         "https://relay.example", AdminURL: "https://admin.example", ClientVersion: "test-client",
+	}
+}
+
+func TestCatalogFailureUsesOfficialFallbackForExistingCredential(t *testing.T) {
+	storage := providerTestStorage(t)
+	provider := New(pluginconfig.Defaults(), mirasim.NewPool())
+	response, err := provider.ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: storage.JSON()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]pluginapi.ModelInfo, len(response.Models))
+	for _, model := range response.Models {
+		byID[model.ID] = model
+	}
+	for _, id := range []string{"claude-sonnet-5", "gpt-6-astra", "deepseek-flash", "glm-5.3-flash", "kimi-k3", "gpt-image-2"} {
+		if _, ok := byID[id]; !ok {
+			t.Fatalf("fallback missing %s", id)
+		}
+	}
+	if _, old := byID["claude-opus-4-6"]; old {
+		t.Fatal("0.0.354 fallback still contains removed Opus 4.6")
+	}
+}
+
+func TestCatalogFailureKeepsLastSuccessfulAccountModels(t *testing.T) {
+	storage := providerTestStorage(t)
+	pool := mirasim.NewPool()
+	host := providerHostClient{do: func(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+		parsed, _ := url.Parse(req.URL)
+		switch parsed.Path {
+		case "/v1/device/session":
+			return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ticket":"ticket","expiresIn":900}`)}, nil
+		case "/v1/models":
+			return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"data":[{"id":"claude-future-9","max_input_tokens":321000},{"id":"gpt-6-astra"}]}`)}, nil
+		default:
+			return pluginapi.HTTPResponse{}, fmt.Errorf("unexpected path %s", parsed.Path)
+		}
+	}}
+	if _, err := pool.Client(storage).ListModels(context.Background(), host); err != nil {
+		t.Fatal(err)
+	}
+	settings := pluginconfig.Defaults()
+	settings.ClientVersion = "test-client"
+	response, err := New(settings, pool).ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: storage.JSON()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]pluginapi.ModelInfo, len(response.Models))
+	for _, model := range response.Models {
+		byID[model.ID] = model
+	}
+	if byID["claude-future-9"].ContextLength != 321000 {
+		t.Fatalf("cached account context lost: %#v", byID["claude-future-9"])
+	}
+	if _, fallbackOnly := byID["deepseek-flash"]; fallbackOnly {
+		t.Fatal("fallback models replaced a cached account catalog")
+	}
+}
 
 // An OAuth-only executor has no static models to register, and CPA skips the
 // static path for that scope regardless of what is returned here.
@@ -24,7 +118,7 @@ func TestStaticModelsPublishNothingForAnOAuthOnlyExecutor(t *testing.T) {
 
 func TestFallbackCatalogCoversOfficialBuiltinFamilies(t *testing.T) {
 	models := withLongContextAliases(fallbackModels())
-	if len(models) != len(fallbackModelIDs)+6 {
+	if len(models) != len(fallbackModelIDs)+5 {
 		t.Fatalf("models = %#v", models)
 	}
 	claudeCount := 0
@@ -52,7 +146,7 @@ func TestFallbackCatalogCoversOfficialBuiltinFamilies(t *testing.T) {
 			t.Fatalf("unexpected model family: %#v", model)
 		}
 	}
-	if claudeCount != 13 || gptCount != 4 {
+	if claudeCount != 11 || gptCount != 4 {
 		t.Fatalf("fallback family counts: Claude=%d GPT=%d", claudeCount, gptCount)
 	}
 	byID := make(map[string]pluginapi.ModelInfo, len(models))
@@ -77,7 +171,7 @@ func TestFallbackCatalogCoversOfficialBuiltinFamilies(t *testing.T) {
 	if fable.ContextLength != 1000000 || fable.MaxCompletionTokens != 128000 || fable.Thinking == nil || !fable.Thinking.DynamicAllowed || fable.Thinking.Min != 0 {
 		t.Fatalf("Claude Fable 5.1 metadata = %#v", fable)
 	}
-	opus := byID["claude-opus-4-6"]
+	opus := modelInfo("claude-opus-4-6", "model", 0, "anthropic")
 	if opus.Created != 1770318000 || opus.ContextLength != 1000000 || opus.MaxCompletionTokens != 128000 || opus.Thinking == nil || opus.Thinking.Min != 0 || opus.Thinking.Max != 0 || !opus.Thinking.DynamicAllowed {
 		t.Fatalf("Claude Opus 4.6 metadata = %#v", opus)
 	}

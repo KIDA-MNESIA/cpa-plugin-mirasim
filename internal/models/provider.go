@@ -14,7 +14,6 @@ var fallbackModelIDs = []string{
 	"claude-fable-5",
 	"claude-fable-5-1",
 	"claude-haiku-4-5",
-	"claude-opus-4-6",
 	"claude-opus-4-8",
 	"claude-opus-5",
 	"claude-sonnet-5",
@@ -157,14 +156,23 @@ func (p *Provider) ModelsForAuth(ctx context.Context, req pluginapi.AuthModelReq
 		return pluginapi.ModelResponse{}, errParse
 	}
 	if storage == nil {
-		return pluginapi.ModelResponse{Provider: credentials.Provider, Models: fallbackModels()}, nil
+		return pluginapi.ModelResponse{Provider: credentials.Provider, Models: withLongContextAliases(withImageAliases(fallbackModels()))}, nil
 	}
-	catalog, errCatalog := p.pool.Client(*storage).ListModels(ctx, req.HTTPClient)
-	if errCatalog != nil {
-		return pluginapi.ModelResponse{}, errCatalog
+	client := p.pool.Client(*storage)
+	catalog, errCatalog := client.ListModels(ctx, req.HTTPClient)
+	var models []pluginapi.ModelInfo
+	var roster mirasim.ModelRoster
+	if errCatalog == nil {
+		models = exposedModels(catalog.Models)
+		roster = client.ModelRoster(ctx, req.HTTPClient)
+	} else if cached := client.CachedModels(); len(cached) > 0 {
+		catalog.Models = cached
+		models = exposedModels(cached)
+		roster = client.CachedModelRoster()
+	} else {
+		models = fallbackModels()
+		roster = client.CachedModelRoster()
 	}
-	models := exposedModels(catalog.Models)
-	roster := p.pool.Client(*storage).ModelRoster(ctx, req.HTTPClient)
 	applyRoster(models, roster)
 	applyCatalogContexts(models, catalog.Models)
 	models = withImageAliases(models)
