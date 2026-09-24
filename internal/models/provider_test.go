@@ -133,13 +133,18 @@ func TestExposedModelsPreferTheServedContextWindow(t *testing.T) {
 	}
 }
 
-func TestRosterOverridesTheServedContextWindow(t *testing.T) {
-	models := exposedModels([]mirasim.RemoteModel{{ID: "gpt-6-astra", MaxInputTokens: 872000}})
+func TestCatalogWindowOverridesRosterBeforeLongContextAliases(t *testing.T) {
+	catalog := []mirasim.RemoteModel{{ID: "claude-sonnet-5", MaxInputTokens: 400000}}
+	models := exposedModels(catalog)
 	applyRoster(models, mirasim.ModelRoster{Version: "live", Agents: map[string][]mirasim.ModelSpec{
-		"codex": {{ID: "gpt-6-astra", ContextWindow: 1050000}},
+		"claude": {{ID: "claude-sonnet-5", ContextWindow: 1000000, Adaptive: true}},
 	}})
-	if models[0].ContextLength != 1050000 || models[0].InputTokenLimit != 1050000 {
-		t.Fatalf("signed roster did not win: %#v", models[0])
+	applyCatalogContexts(models, catalog)
+	if models[0].ContextLength != 400000 || models[0].InputTokenLimit != 400000 {
+		t.Fatalf("account catalog did not win: %#v", models[0])
+	}
+	if aliases := withLongContextAliases(models); len(aliases) != 1 {
+		t.Fatalf("an unserved [1m] alias was added: %#v", aliases)
 	}
 }
 

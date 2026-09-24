@@ -141,6 +141,7 @@ func (p *Provider) ModelsForAuth(ctx context.Context, req pluginapi.AuthModelReq
 	models := exposedModels(catalog.Models)
 	roster := p.pool.Client(*storage).ModelRoster(ctx, req.HTTPClient)
 	applyRoster(models, roster)
+	applyCatalogContexts(models, catalog.Models)
 	models = withLongContextAliases(models)
 	return pluginapi.ModelResponse{Provider: credentials.Provider, Models: models}, nil
 }
@@ -170,14 +171,27 @@ func exposedModels(catalog []mirasim.RemoteModel) []pluginapi.ModelInfo {
 }
 
 // applyCatalogContext prefers the context window the account's own catalog
-// reports over the static fallback, which is only a snapshot of one inspected
-// client build. A signed roster still overrides both.
+// reports over both the signed roster and the static fallback.
 func applyCatalogContext(model *pluginapi.ModelInfo, contextWindow int64) {
 	if contextWindow <= 0 {
 		return
 	}
 	model.ContextLength = contextWindow
 	model.InputTokenLimit = contextWindow
+}
+
+// The desktop client uses a served max_input_tokens before roster metadata.
+// Reapply account-specific windows after the roster, before adding [1m] aliases.
+func applyCatalogContexts(models []pluginapi.ModelInfo, catalog []mirasim.RemoteModel) {
+	served := make(map[string]int64, len(catalog))
+	for _, remote := range catalog {
+		if remote.MaxInputTokens > 0 {
+			served[strings.ToLower(strings.TrimSpace(remote.ID))] = remote.MaxInputTokens
+		}
+	}
+	for i := range models {
+		applyCatalogContext(&models[i], served[strings.ToLower(models[i].ID)])
+	}
 }
 
 // isExposedModel keeps the families this plugin has a wire for: Claude goes to
