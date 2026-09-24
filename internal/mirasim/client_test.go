@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	pluginconfig "github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/config"
 	"github.com/router-for-me/CLIProxyAPIPlugins/mirasim/internal/credentials"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -30,6 +31,31 @@ import (
 type fakeHostClient struct {
 	do       func(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error)
 	doStream func(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error)
+}
+
+func TestCurrentDefaultClientVersionIsSignedOnControlRequests(t *testing.T) {
+	t.Setenv("MIRASIM_CLIENT_VERSION", "")
+	storage, publicKey, _ := newTestStorage(t, futureJWT())
+	storage.ClientVersion = pluginconfig.Defaults().ClientVersion
+	client := NewClient(storage)
+	host := fakeHostClient{do: func(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+		path := mustRequestPath(t, req.URL)
+		if req.Headers.Get(headerMirasimClient) != "0.0.354" {
+			t.Errorf("signed client version = %q", req.Headers.Get(headerMirasimClient))
+		}
+		if path == sessionPath {
+			assertDeviceSessionRequest(t, publicKey, req, storage.AccessToken)
+			return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"ticket":"ticket","expiresIn":900}`)}, nil
+		}
+		if path == modelsPath {
+			assertControlPlaneRequest(t, publicKey, req, "ticket")
+			return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[{"id":"claude-sonnet-5"}]}`)}, nil
+		}
+		return pluginapi.HTTPResponse{}, fmt.Errorf("unexpected path %s", path)
+	}}
+	if _, err := client.ListModels(context.Background(), host); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (f fakeHostClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
@@ -991,9 +1017,6 @@ func assertV2Signature(t *testing.T, publicKey ed25519.PublicKey, req pluginapi.
 	}
 	if !ed25519.Verify(publicKey, payload, signature) {
 		t.Errorf("invalid signature for %s %s", req.Method, parsed.Path)
-	}
-	if req.Headers.Get(headerMirasimClient) != "test-client" {
-		t.Errorf("client version = %q", req.Headers.Get(headerMirasimClient))
 	}
 }
 

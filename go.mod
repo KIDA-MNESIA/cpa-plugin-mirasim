@@ -3,7 +3,7 @@ module github.com/router-for-me/CLIProxyAPIPlugins/mirasim
 go 1.26.0
 
 require (
-	github.com/router-for-me/CLIProxyAPI/v7 v7.3.9
+	github.com/router-for-me/CLIProxyAPI/v7 v7.3.17
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
 	golang.org/x/crypto v0.54.0

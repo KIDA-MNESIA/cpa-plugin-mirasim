@@ -88,7 +88,7 @@ var modelDefinitions = map[string]modelDefinition{
 		thinking: adaptiveRelayThinking(), modelType: "claude", owner: "anthropic",
 	},
 	// Context windows come from the catalog the official client falls back to
-	// when the relay publishes none, read out of the 0.0.336 build: Astra at
+	// when the relay publishes none, confirmed in the 0.0.354 build: Astra at
 	// 0xd4e40 and the GPT 5.6 models at 0x5ad20. Its model-picker list disagrees;
 	// the fallback catalog is the one that stands in for the relay's own table.
 	"gpt-6-astra": {

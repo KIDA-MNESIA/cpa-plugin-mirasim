@@ -4,7 +4,7 @@ A native [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin for 
 
 ## Requirements
 
-- CLIProxyAPI `v7.3.9` or a later plugin ABI/schema release. The plugin reports plugin schema 6, which a host older than `v7.3.0` refuses to load; stay on plugin `v0.7.x` to keep a `v7.2.x` host.
+- CLIProxyAPI `v7.3.17` or later. This release builds against `v7.3.17` and uses its image executor format and request-path metadata; older hosts may reject the plugin or fail to route image requests.
 - For source builds: Go 1.26+ and a C compiler supporting `c-shared`.
 - A private, persistent, writable CPA `auth-dir`.
 
@@ -39,7 +39,7 @@ plugins:
       enabled: true
 ```
 
-Optional settings are `relay-url` (default `https://relay.mirasim.ai`), `admin-url` (default `https://auth.mirasim.ai`), `client-version` (default `0.0.336`), `oauth-login-provider` (default `github`; it marks the default sign-in method on the browser start page), and `oauth-callback-port` (unset, meaning an ephemeral port; it applies only to `--mirasim-login`). Explicit configuration overrides the corresponding `MIRASIM_RELAY_URL`, `MIRASIM_ADMIN_URL`, `MIRASIM_CLIENT_VERSION`, `MIRASIM_OAUTH_LOGIN_PROVIDER`, and `MIRASIM_OAUTH_CALLBACK_PORT` environment variables.
+Optional settings are `relay-url` (default `https://relay.mirasim.ai`), `admin-url` (default `https://auth.mirasim.ai`), `client-version` (default `0.0.354`), `oauth-login-provider` (default `github`; it marks the default sign-in method on the browser start page), and `oauth-callback-port` (unset, meaning an ephemeral port; it applies only to `--mirasim-login`). Explicit configuration overrides the corresponding `MIRASIM_RELAY_URL`, `MIRASIM_ADMIN_URL`, `MIRASIM_CLIENT_VERSION`, `MIRASIM_OAUTH_LOGIN_PROVIDER`, and `MIRASIM_OAUTH_CALLBACK_PORT` environment variables.
 
 Write `oauth-callback-port` as a plain number such as `18317`; a quoted `"18317"` is accepted too, so a strict YAML linter cannot break the flow. A value outside 1-65535, including `0`, is ignored and an ephemeral port is used instead.
 

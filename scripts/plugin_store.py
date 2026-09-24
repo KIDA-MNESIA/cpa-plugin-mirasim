@@ -78,7 +78,7 @@ def store_entry(repository, author):
         "id": PLUGIN_ID,
         "name": "Mirasim Provider",
         "description": (
-            "Adds Mirasim OAuth accounts, Claude Messages and GPT Responses forwarding, "
+            "Adds Mirasim OAuth accounts, text and image routing, "
             "dynamic models, token refresh, and quota reporting to CLIProxyAPI."
         ),
         "author": author.strip(),

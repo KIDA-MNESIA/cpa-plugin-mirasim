@@ -4,7 +4,7 @@
     {
       "id": "mirasim",
       "name": "Mirasim Provider",
-      "description": "Adds Mirasim OAuth accounts, Messages and GPT Responses forwarding, dynamic models, token refresh, and quota reporting to CLIProxyAPI.",
+      "description": "Adds Mirasim OAuth accounts, text and image routing, dynamic models, token refresh, and quota reporting to CLIProxyAPI.",
       "author": "KIDA-MNESIA",
       "repository": "https://github.com/KIDA-MNESIA/cpa-plugin-mirasim",
       "homepage": "https://github.com/KIDA-MNESIA/cpa-plugin-mirasim",
