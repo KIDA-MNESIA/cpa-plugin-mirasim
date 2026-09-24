@@ -39,7 +39,7 @@ plugins:
       enabled: true
 ```
 
-Optional settings are `relay-url` (default `https://relay.mirasim.ai`), `admin-url` (default `https://auth.mirasim.ai`), `client-version` (default `0.0.336`), `oauth-login-provider` (default `github`), and `oauth-callback-port` (unset, meaning an ephemeral port; it applies only to `--mirasim-login`). Explicit configuration overrides the corresponding `MIRASIM_RELAY_URL`, `MIRASIM_ADMIN_URL`, `MIRASIM_CLIENT_VERSION`, `MIRASIM_OAUTH_LOGIN_PROVIDER`, and `MIRASIM_OAUTH_CALLBACK_PORT` environment variables.
+Optional settings are `relay-url` (default `https://relay.mirasim.ai`), `admin-url` (default `https://auth.mirasim.ai`), `client-version` (default `0.0.336`), `oauth-login-provider` (default `github`; it marks the default sign-in method on the browser start page), and `oauth-callback-port` (unset, meaning an ephemeral port; it applies only to `--mirasim-login`). Explicit configuration overrides the corresponding `MIRASIM_RELAY_URL`, `MIRASIM_ADMIN_URL`, `MIRASIM_CLIENT_VERSION`, `MIRASIM_OAUTH_LOGIN_PROVIDER`, and `MIRASIM_OAUTH_CALLBACK_PORT` environment variables.
 
 Write `oauth-callback-port` as a plain number such as `18317`; a quoted `"18317"` is accepted too, so a strict YAML linter cannot break the flow. A value outside 1-65535, including `0`, is ignored and an ephemeral port is used instead.
 
@@ -55,15 +55,15 @@ If you set `oauth-public-base-url`, delete the key; the plugin logs a warning wh
 
 ## OAuth login
 
-Browser login runs on CPA's own native plugin login abstraction: Management Center calls `GET /v0/management/mirasim-auth-url`, which reaches the plugin's `StartLogin`; the browser follows the returned Mirasim `/auth/oauth/<provider>/login` URL; Management Center then polls `GET /v0/management/get-auth-status?state=...`, which reaches `PollLogin`, and CPA saves the credential it returns. Both of those routes belong to the host and are management-key protected.
+Browser login runs on CPA's own native plugin login abstraction: Management Center calls `GET /v0/management/mirasim-auth-url`, which reaches the plugin's `StartLogin`; the plugin answers with its own start page, the browser chooses a sign-in method there, and Management Center then polls `GET /v0/management/get-auth-status?state=...`, which reaches `PollLogin`, and CPA saves the credential it returns. Those two routes belong to the host and are management-key protected.
 
-Mirasim answers a login with `access_token` and `refresh_token` directly in the callback query rather than with an OAuth `code`, so CPA's `/v0/management/oauth-callback` cannot receive it — that endpoint rejects a callback with no `code` and persists only `{code, state, error}`. That is also why Management Center's "submit callback URL" box cannot complete a Mirasim login, whatever is pasted into it; the panel shows that box for every plugin login, and a plugin cannot remove it. The plugin instead registers two resource routes with CPA, both served on CPA's own port: `GET /v0/resource/plugins/mirasim/oauth/start`, a start page, and `GET /v0/resource/plugins/mirasim/oauth/callback`.
+Mirasim answers a login with `access_token` and `refresh_token` directly in the callback query rather than with an OAuth `code`, so CPA's `/v0/management/oauth-callback` cannot receive it — that endpoint rejects a callback with no `code` and persists only `{code, state, error}`. That is also why Management Center's "submit callback URL" box cannot complete a Mirasim login, whatever is pasted into it; the panel shows that box for every plugin login, and a plugin cannot remove it. The plugin instead registers five GET-only resource routes with CPA, all served on CPA's own port under `/v0/resource/plugins/mirasim`: `oauth/start`, the start page that lists the sign-in methods and takes a pasted callback URL; `oauth/authorize`, the redirect to the chosen provider; `oauth/callback`, the Mirasim callback; `oauth/email/send`, which mails a sign-in code; and `oauth/email/verify`, which exchanges the code for credentials.
 
-`mirasim-auth-url` returns the start page's path, relative on purpose: Management Center's "open link" button opens it against the address Management Center itself is opened on, which is the one address the browser is known to reach CPA on, while CPA only ever reports `127.0.0.1` to the plugin. The start page links to Mirasim and has a box for the callback URL, described under [Remote CPA hosts](#remote-cpa-hosts). This needs Management Center served by CPA itself (`/management.html`, the default); a panel hosted on another origin would resolve the relative path against that origin instead.
+`mirasim-auth-url` returns the start page's path, relative on purpose: Management Center's "open link" button opens it against the address Management Center itself is opened on, which is the one address the browser is known to reach CPA on, while CPA only ever reports `127.0.0.1` to the plugin. The page lists one button per provider Mirasim currently offers, marks the configured default, carries the email-code form described under [Email code login](#email-code-login), and keeps the box for a callback URL pasted back by hand, described under [Remote CPA hosts](#remote-cpa-hosts). This needs Management Center served by CPA itself (`/management.html`, the default); a panel hosted on another origin would resolve the relative path against that origin instead.
 
-Mirasim only redirects to a loopback address (or its own domain), so the callback address is always `http://127.0.0.1:<CPA port>/v0/resource/plugins/mirasim/oauth/callback?state=<state>`, using the port and scheme CPA itself reports. Mirasim ignores the `state` parameter of its login URL but keeps the query of `redirect_uri` and appends the tokens after it, so the state travels inside the callback address. Both routes answer only for the state of a pending login; the callback accepts it once, and the login is forgotten after thirty minutes.
+Mirasim only redirects to a loopback address (or its own domain), so the callback address is always `http://127.0.0.1:<CPA port>/v0/resource/plugins/mirasim/oauth/callback?state=<state>`, using the port and scheme CPA itself reports. Mirasim ignores the `state` parameter of its login URL but keeps the query of `redirect_uri` and appends the tokens after it, so the state travels inside the callback address. Every login route answers only for the state of a pending login; the callback and the email verify each accept one result, and the login is forgotten after thirty minutes.
 
-`oauth-login-provider` names the Mirasim sign-in provider used when the request names none; it defaults to `github`. A caller can override it for one login with a query parameter, `GET /v0/management/mirasim-auth-url?provider=google`. Either way the ID is checked against Mirasim's `/auth/oauth/providers` before any login URL is issued, so an ID the service is not currently offering fails with an error naming the ones it is, instead of sending the browser to a dead provider.
+`StartLogin` discovers Mirasim's `/auth/oauth/providers` once and keeps the whole list on the pending login; the start page shows all of it. `oauth-login-provider` and the `provider` query parameter, `GET /v0/management/mirasim-auth-url?provider=google`, only choose which button is marked as the default: the request parameter wins over the configuration, which defaults to `github`. A configured provider Mirasim does not offer leaves the page with no marked default and the login still works; an explicitly requested `?provider=` that is not offered fails to start, with an error naming the offered set. A failed or empty discovery is an error, because there would be nothing to list. A button links to the plugin's own `oauth/authorize` route, which records the choice on the pending login and only then redirects to Mirasim; a bad state, an unoffered provider or a spent login answers with a page and never redirects.
 
 For a local interactive CPA process:
 
@@ -71,7 +71,7 @@ For a local interactive CPA process:
 .\CLIProxyAPI.exe -config .\config.yaml --mirasim-login --mirasim-login-provider github
 ```
 
-`--mirasim-login-provider` takes any provider ID the service currently offers, validated through the same discovery endpoint; omit the flag to use the configured `oauth-login-provider`. CPA's `--no-browser` flag is supported. The command runs in a CPA process that serves no HTTP, so its callback lands on a single-use listener the plugin binds on `127.0.0.1` at a random `/callback/<token>` path instead; `oauth-callback-port` pins that listener's port. After about fifteen seconds the command also offers to accept the callback URL pasted back by hand, which completes a login whose browser could not reach the listener. Credentials are validated and saved by CPA; no external credential-directory import is supported.
+The CLI has no chooser: `--mirasim-login-provider` names the one provider to use, validated through the same discovery endpoint; omit the flag to use the configured `oauth-login-provider`. CPA's `--no-browser` flag is supported. The command runs in a CPA process that serves no HTTP, so its callback lands on a single-use listener the plugin binds on `127.0.0.1` at a random `/callback/<token>` path instead; `oauth-callback-port` pins that listener's port. After about fifteen seconds the command also offers to accept the callback URL pasted back by hand, which completes a login whose browser could not reach the listener. Credentials are validated and saved by CPA; no external credential-directory import is supported.
 
 ### Remote CPA hosts
 
@@ -80,20 +80,28 @@ A browser resolves `127.0.0.1` on the machine it is itself running on, so the ca
 When Management Center is opened on a LAN address or a domain instead:
 
 1. Press "open link" in Management Center. The Mirasim start page opens on that same address.
-2. Press "前往 Mirasim 授权" (authorize with Mirasim). Mirasim opens in a new tab; sign in there. That tab ends on a "can't be reached" page at `http://127.0.0.1:<CPA port>/v0/resource/plugins/mirasim/oauth/callback?...`.
+2. Press a provider button such as "Continue with GitHub". Mirasim opens in a new tab; sign in there. That tab ends on a "can't be reached" page at `http://127.0.0.1:<CPA port>/v0/resource/plugins/mirasim/oauth/callback?...`.
 3. Copy the full address from that tab's address bar, paste it into the start page's box and press "完成登录" (complete sign-in). The page submits it to the callback on the address it was opened on, so the host part of the pasted address does not matter, and a reverse proxy's path prefix is kept. Management Center shows the login within its next poll.
+
+Or use the email form on the same page instead of steps 2 and 3: enter the account address, press "发送验证码 / Email me a code", and enter the mailed code on the page that follows. Those pages are served on the address the start page was opened on, so this path never needs a callback URL pasted back and never needs a browser that can reach `127.0.0.1`.
 
 Pasting something other than the callback address, such as the authorize link, is refused without ending the login, so the right address can still be pasted. Do all of this within thirty minutes of starting the login. Opening the callback address directly with its host replaced by the Management Center address works too. Running `--mirasim-login --no-browser` in a shell on the CPA host, or `docker exec -it <container> ./CLIProxyAPI -config <config> --mirasim-login --no-browser` for Docker, with the pasted-callback prompt above, avoids the start page altogether.
 
 ## Email code login
 
-A Mirasim account with no OAuth provider bound to it cannot use any of the flows above. Sign it in with a mailed code instead:
+A Mirasim account with no OAuth provider bound to it cannot use any of the OAuth flows above. Sign it in with a mailed code instead, from Management Center or from the CLI.
+
+In Management Center, press "open link" as usual, then use the email form on the Mirasim start page: enter the account address and press "发送验证码 / Email me a code". Mirasim mails a code, the plugin serves a code-entry page on the same address, and the login completes when the code is accepted; Management Center picks the credential up on its next poll. Nothing is pasted back and `127.0.0.1` is never involved, so this path works unchanged on a LAN address or a domain.
+
+Sends are rate-limited per pending login: at most three codes, at least a minute apart, and five wrong codes end the login (an earlier wrong code leaves it pending with a retry notice). The address is stored on the pending login and the verify step reads it from there, never from the request, so a verify cannot be aimed at an address Mirasim did not mail. The login lives for the same thirty minutes as a provider login, and a response without a refresh token is refused rather than saved, because CPA cannot keep such a credential alive.
+
+Where no panel is available, the CLI does the same:
 
 ```powershell
 .\CLIProxyAPI.exe -config .\config.yaml --mirasim-login --mirasim-login-email you@example.com
 ```
 
-Mirasim mails a code and the command prompts for it. Where no prompt can be answered, run the same command once to send the code, then again with `--mirasim-login-code <code>` to complete the login without a prompt. This is the CLI only, and structurally so: CPA's plugin login abstraction hands the plugin caller input exactly once, in the query string of `GET /v0/management/mirasim-auth-url`, and the `get-auth-status` polls that follow replay only the metadata the plugin registered when the login started. A code Mirasim mails after that first call has nowhere to be entered: the plugin's pages serve only OAuth login. A response without a refresh token is refused rather than saved, because CPA cannot keep such a credential alive.
+Mirasim mails a code and the command prompts for it. Where no prompt can be answered, run the same command once to send the code, then again with `--mirasim-login-code <code>` to complete the login without a prompt.
 
 ## Relay collection and metadata
 
@@ -131,20 +139,30 @@ CPA Responses compact requests use `/v1/responses/compact`, including the `/back
 
 ## Quota and client validation
 
-The plugin registers as a CPA quota provider, so a Mirasim credential reports
-`supports_quota` and a stock Management Center renders it on its own quota page.
-The same data is available over the Management API:
+The plugin registers as a CPA quota provider, so a Mirasim credential reports `supports_quota`, and the same limits are available over the Management API:
 
 ```text
 POST /v0/management/quota/fetch                 {"auth_index": "<runtime-auth-index>"}
 GET  /v0/management/plugins/mirasim/quota?auth_index=<runtime-auth-index>
 ```
 
+Those routes are CPA's own and management-key protected. Management Center `v1.24.2` resolves quota cards through a compile-time list of adapters, so its own quota page does not draw a plugin quota provider. The plugin instead publishes a page the panel can embed: the panel lists it as the **Mirasim Quota** menu entry and opens it in an iframe at
+
+```text
+/v0/resource/plugins/mirasim/quota/<segment>
+```
+
+`<segment>` is a lower-cased random string of about 128 bits generated once per plugin process, so it survives a config save and changes only on a plugin reload. Resource routes cannot carry a management key, so that unguessable segment is the page's only access control: the operator learns it through the authenticated plugin list, but it appears in CPA request logs and browser history, and anyone holding the URL can read the account's limits until the plugin is reloaded. The page shows the plan and free/paid tier, account-wide and model-scoped windows, remaining percentages and UTC reset times, and never a token, email address, device key or auth index. A credential whose limits cannot be read renders as unavailable on an otherwise 200 page.
+
+The page sends `frame-ancestors 'self'`, which permits the panel's iframe while CPA serves `/management.html` from its own origin (the default). An operator who disables that (`home.enabled` or `remote-management.disable-control-panel`) and serves the panel from a separate origin will have the iframe blocked by that policy.
+
+Each page load reads the credential list through the host callbacks and then makes one `GET /v1/limits` request per Mirasim credential, plus a device-ticket mint when the ticket has gone stale. Nothing is cached, so a panel left open on a refreshing iframe repeats those calls; nothing on this path is billable and nothing triggers inference.
+
 Account-wide windows and model-scoped ones such as `7d_fable` are grouped separately, so one spent model does not read as a spent account. Resetting is reported as unsupported because Mirasim publishes limits and offers no route that clears them.
 
 Quotas come only from `GET /v1/limits`. Unavailable limits report no buckets; quota checks never trigger inference. Utilization is rounded once to one decimal and then saturates at 99%, matching the official client.
 
-Both Management API routes above are CPA's own; the plugin's only routes are the two OAuth login resources. Earlier releases served this data from a plugin-owned route and needed a patched Management Center to draw it; neither is the case now, and a stock panel reads it over those host routes.
+Both Management API routes above are CPA's own; the plugin's own routes are the five login resources plus the quota page. Earlier releases needed a patched Management Center to draw plugin quota; the embeddable page is what replaces that patch.
 
 Validate inference with an actual Claude Code or Codex client and correlate the result with CPA logs. A minimal hand-written Messages request can fail even when the real client works. Model catalog presence does not guarantee upstream capacity.
 
@@ -193,7 +211,7 @@ Place all seven ZIPs and their `.zip.sha256` sidecars in `dist/release` for the 
 
 Native plugins run inside CPA. Protect `auth-dir`: it contains bearer tokens and private keys.
 
-The plugin exposes two endpoints through CPA: the OAuth start page and callback, which CPA serves without management authentication because a browser navigation cannot carry the management key, the same as CPA's own `/codex/callback`. Both answer only for the 256-bit state of a pending login and for at most thirty minutes, the callback accepts one login result, and no page reflects a callback value. The start page reveals only the Mirasim authorize link, and its form may submit only to CPA's own origin. The callback carries `access_token` and `refresh_token` in its query string, and a pasted callback travels as the `token_url` parameter. CPA's own request log masks query values whose names contain `token`, which covers all three, but a reverse proxy in front of CPA may log full request URLs, and the URL left in the address bar is a live credential: do not share it. The only listener the plugin opens itself is the `--mirasim-login` callback on `127.0.0.1`, which answers one request on a random path and then closes.
+The plugin exposes six endpoints through CPA: the five login resources (`oauth/start`, `oauth/authorize`, `oauth/callback`, `oauth/email/send`, `oauth/email/verify`) and the quota page under `/quota/`. All are GET-only, and CPA serves them without management authentication because a browser navigation cannot carry the management key, the same as CPA's own `/codex/callback`. Every login route answers only for the 256-bit state of a pending login and for at most thirty minutes; the callback and the email verify each accept one result, and no page reflects a callback value. The quota page instead gates on its unguessable segment (see [Quota and client validation](#quota-and-client-validation)). The start and code pages may submit only to CPA's own origin (`form-action 'self'`); the quota page sets `form-action 'none'` and `frame-ancestors 'self'`, while the login pages keep `frame-ancestors 'none'`. The callback carries `access_token` and `refresh_token` in its query string; a pasted callback travels as the `token_url` parameter, the email address as `token_email`, and the code as `token_code`. CPA's own request log masks query values whose names contain `token`, which covers all of them, but a reverse proxy in front of CPA may log full request URLs, and the URL left in the address bar is a live credential: do not share it. The only listener the plugin opens itself is the `--mirasim-login` callback on `127.0.0.1`, which answers one request on a random path and then closes.
 
 Licensed under the [MIT License](LICENSE).
 
