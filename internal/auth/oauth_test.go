@@ -655,6 +655,63 @@ func TestEmailSendPinsTheFirstMailedAddress(t *testing.T) {
 	}
 }
 
+// A competing send cannot re-point the login while a code request is still in
+// flight upstream: the pin is committed before the outbound call, so this holds
+// whatever emailLoginTimeout and emailCodeSendInterval are set to. The first
+// send is held inside Mirasim until after the assertion.
+func TestEmailSendCannotRepointALoginWhileASendIsInFlight(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	arrived, release := fake.holdCodeRequests()
+	defer release()
+	type outcome struct {
+		status int
+		body   string
+		err    error
+	}
+	first := make(chan outcome, 1)
+	go func() {
+		resp, errHandle := provider.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+			Method: http.MethodGet,
+			Path:   testResourceBasePath + OAuthEmailSendResource,
+			Query: url.Values{
+				"state":           []string{started.State},
+				emailAddressField: []string{"first@example.com"},
+			},
+		})
+		first <- outcome{status: resp.StatusCode, body: string(resp.Body), err: errHandle}
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first code request never reached Mirasim")
+	}
+	status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"attacker@example.com"},
+	})
+	if status != http.StatusConflict || !strings.Contains(body, "bound to another address") {
+		t.Fatalf("send during an in-flight send = %d, body = %s", status, body)
+	}
+	if strings.Contains(body, "first@example.com") || strings.Contains(body, "attacker@example.com") {
+		t.Fatal("the refusal page reflected an address")
+	}
+	release()
+	got := <-first
+	if got.err != nil {
+		t.Fatalf("first send error = %v", got.err)
+	}
+	if got.status != http.StatusOK {
+		t.Fatalf("first send = %d, body = %s", got.status, got.body)
+	}
+	if addresses := fake.sentAddresses(); len(addresses) != 1 || addresses[0] != "first@example.com" {
+		t.Fatalf("code requests = %#v, want only the first address", addresses)
+	}
+}
+
 // A send Mirasim rejects still spends one of the login's three sends, but it
 // does not pin the address, so a typo can be corrected on the next send.
 func TestEmailSendFailureLeavesTheAddressUnpinned(t *testing.T) {
@@ -1498,6 +1555,26 @@ type emailAuthFake struct {
 	verified []emailVerifyCall
 	reject   bool
 	sendFail bool
+	hold     *emailSendHold
+}
+
+// emailSendHold keeps a code request inside the fake until the test releases
+// it, so a competing send can be issued against the same login while the first
+// one is still in flight.
+type emailSendHold struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// holdCodeRequests announces each arriving code request on the returned
+// channel and blocks it until the returned function is called.
+func (f *emailAuthFake) holdCodeRequests() (<-chan struct{}, func()) {
+	hold := &emailSendHold{started: make(chan struct{}, 1), release: make(chan struct{})}
+	f.mu.Lock()
+	f.hold = hold
+	f.mu.Unlock()
+	return hold.started, func() { hold.once.Do(func() { close(hold.release) }) }
 }
 
 func (f *emailAuthFake) rejectCodes() {
@@ -1546,7 +1623,12 @@ func (f *emailAuthFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.sent = append(f.sent, body["email"])
 		fail := f.sendFail
+		hold := f.hold
 		f.mu.Unlock()
+		if hold != nil {
+			hold.started <- struct{}{}
+			<-hold.release
+		}
 		if fail {
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`{"detail":"mail transport unavailable"}`))

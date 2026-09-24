@@ -94,6 +94,13 @@ type oauthSession struct {
 	// emailSentAt and emailSends rate limit the send route on this login.
 	emailSentAt time.Time
 	emailSends  int
+	// emailMailed records whether any send reached Mirasim and
+	// emailSendsInFlight counts the sends past their commit point. The pin goes
+	// on before the outbound call and a failed send clears it only when nothing
+	// was ever mailed and no sibling send is still running, so a failure can
+	// never undo a pin another send legitimately established.
+	emailMailed        bool
+	emailSendsInFlight int
 	// emailAttempts counts wrong codes tried against this login.
 	emailAttempts int
 	callbackURL   string
@@ -363,28 +370,40 @@ func (p *Provider) handleOAuthEmailSend(ctx context.Context, req pluginapi.Manag
 		p.oauth.mu.Unlock()
 		return callbackPageResponse(http.StatusTooManyRequests, emailCodeLimitedPage)
 	}
-	// Spend the send before the outbound call: the request leaves this process
-	// even when Mirasim rejects it, so only counting successes would leave the
-	// relay unbounded. Doing it under the lock that checked the interval also
-	// turns two concurrent submits into one send. The address itself is pinned
-	// only after Mirasim confirms the mail, so a send that fails upstream leaves
-	// the address unpinned and a typo fixable.
+	// Pin and spend under one lock hold, before the outbound call: the pin has
+	// to be visible to a competing send for the whole time this one is in
+	// flight, or a caller holding the state could re-point the login while
+	// Mirasim is still mailing the first code. Spending here also means the
+	// request leaves this process even when Mirasim rejects it, so counting only
+	// successes would leave the relay unbounded, and it turns two concurrent
+	// submits into one send.
+	if session.email == "" {
+		session.email = address
+	}
 	session.emailSends++
+	session.emailSendsInFlight++
 	session.emailSentAt = now
 	proxyURL := session.proxyURL
 	p.oauth.mu.Unlock()
 
-	if errSend := requestEmailCode(ctx, p.settings.AdminURL, proxyURL, address); errSend != nil {
-		return callbackPageResponse(http.StatusBadGateway, emailSendFailedPage)
-	}
+	errSend := requestEmailCode(ctx, p.settings.AdminURL, proxyURL, address)
 
 	p.oauth.mu.Lock()
+	session.emailSendsInFlight--
+	if errSend != nil {
+		// Reopen the address only when nothing was ever mailed and no other
+		// send is still in flight, so a failure cannot wipe a pin a sibling
+		// send established and a typo stays fixable.
+		if !session.emailMailed && session.emailSendsInFlight == 0 {
+			session.email = ""
+		}
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusBadGateway, emailSendFailedPage)
+	}
+	session.emailMailed = true
 	p.oauth.purgeLocked(p.oauth.now())
 	remaining := 0
 	if current := p.oauth.sessions[state]; current != nil && current == session {
-		if !current.callbackDone && current.auth == nil && current.email == "" {
-			current.email = address
-		}
 		remaining = maxEmailCodeSends - current.emailSends
 	}
 	p.oauth.mu.Unlock()
