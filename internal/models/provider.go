@@ -27,6 +27,10 @@ var fallbackModelIDs = []string{
 	"kimi-k3",
 }
 
+var imageModelIDs = []string{
+	"gpt-image-1.5", "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.5",
+}
+
 type modelDefinition struct {
 	displayName string
 	version     string
@@ -163,6 +167,7 @@ func (p *Provider) ModelsForAuth(ctx context.Context, req pluginapi.AuthModelReq
 	roster := p.pool.Client(*storage).ModelRoster(ctx, req.HTTPClient)
 	applyRoster(models, roster)
 	applyCatalogContexts(models, catalog.Models)
+	models = withImageAliases(models)
 	models = withLongContextAliases(models)
 	return pluginapi.ModelResponse{Provider: credentials.Provider, Models: models}, nil
 }
@@ -187,6 +192,27 @@ func exposedModels(catalog []mirasim.RemoteModel) []pluginapi.ModelInfo {
 		model := modelInfo(remote.ID, remote.Object, remote.Created, remote.OwnedBy)
 		applyCatalogContext(&model, remote.MaxInputTokens)
 		models = append(models, model)
+	}
+	return models
+}
+
+// CPA's images handlers route these image selectors by model ID. The official
+// Codex proxy forwards them even though the text model picker omits them.
+func withImageAliases(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+	seen := make(map[string]bool, len(models))
+	hasGPT := false
+	for _, model := range models {
+		id := strings.ToLower(model.ID)
+		seen[id] = true
+		hasGPT = hasGPT || strings.HasPrefix(id, "gpt-") && !strings.HasPrefix(id, "gpt-image-")
+	}
+	if !hasGPT {
+		return models
+	}
+	for _, id := range imageModelIDs {
+		if !seen[id] {
+			models = append(models, modelInfo(id, "model", 0, "openai"))
+		}
 	}
 	return models
 }
@@ -228,6 +254,9 @@ func isExposedModel(id string) bool {
 func modelInfo(id, object string, created int64, owner string) pluginapi.ModelInfo {
 	id = strings.TrimSpace(id)
 	definition, known := modelDefinitions[strings.ToLower(id)]
+	if !known {
+		definition = genericDefinition(id)
+	}
 	if object == "" {
 		object = "model"
 	}
@@ -240,10 +269,7 @@ func modelInfo(id, object string, created int64, owner string) pluginapi.ModelIn
 	if created == 0 {
 		created = definition.created
 	}
-	if !known {
-		definition = genericDefinition(id)
-	}
-	return pluginapi.ModelInfo{
+	model := pluginapi.ModelInfo{
 		ID:                         id,
 		Object:                     object,
 		Created:                    created,
@@ -263,10 +289,18 @@ func modelInfo(id, object string, created int64, owner string) pluginapi.ModelIn
 		SupportedOutputModalities:  []string{"text"},
 		Thinking:                   cloneThinking(definition.thinking),
 	}
+	if definition.modelType == "openai-image" {
+		model.SupportedInputModalities = []string{"text", "image"}
+		model.SupportedOutputModalities = []string{"image"}
+	}
+	return model
 }
 
 func genericDefinition(id string) modelDefinition {
 	id = strings.ToLower(strings.TrimSpace(id))
+	if strings.HasPrefix(id, "gpt-image-") {
+		return modelDefinition{modelType: "openai-image", methods: []string{"images/generations", "images/edits"}, owner: "openai"}
+	}
 	if strings.HasPrefix(id, "claude-") || strings.HasPrefix(id, "deepseek-") || strings.HasPrefix(id, "glm-") || strings.HasPrefix(id, "kimi-") {
 		modelType := "claude"
 		switch {

@@ -100,7 +100,7 @@ func TestSignatureV2UsesBlankMetadataLineWhenMetadataIsEmpty(t *testing.T) {
 }
 
 func TestRelayAgentRecognizesCodexRoutes(t *testing.T) {
-	for _, requestPath := range []string{"/v1/responses", "/v1/alpha/search"} {
+	for _, requestPath := range []string{"/v1/responses", "/v1/alpha/search", "/v1/images/generations", "/v1/images/edits"} {
 		if got := relayAgent(requestPath); got != "codex" {
 			t.Fatalf("relayAgent(%q) = %q, want codex", requestPath, got)
 		}

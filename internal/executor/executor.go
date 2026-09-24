@@ -19,6 +19,7 @@ import (
 )
 
 var SupportedFormats = []string{
+	"openai-image",
 	sdktranslator.FormatOpenAI.String(),
 	sdktranslator.FormatOpenAIResponse.String(),
 	sdktranslator.FormatClaude.String(),
@@ -39,6 +40,9 @@ func (e *Executor) Identifier() string { return credentials.Provider }
 
 func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
 	ctx = mirasim.WithRequestIdentity(ctx, req.Metadata)
+	if sourceFormat(req).String() == "openai-image" {
+		return e.executeImage(ctx, req)
+	}
 	if req.Alt == "responses/compact" {
 		return e.executeCompact(ctx, req)
 	}
@@ -76,6 +80,9 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 
 func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
 	ctx = mirasim.WithRequestIdentity(ctx, req.Metadata)
+	if sourceFormat(req).String() == "openai-image" {
+		return e.executeImageStream(ctx, req)
+	}
 	if req.Alt == "responses/compact" {
 		return pluginapi.ExecutorStreamResponse{}, compactError("streaming is not supported for /responses/compact")
 	}
@@ -165,18 +172,25 @@ func (e *Executor) HttpRequest(ctx context.Context, req pluginapi.ExecutorHTTPRe
 		method = http.MethodPost
 	}
 	body := append([]byte(nil), req.Body...)
+	var headers http.Header
 	if len(body) > 0 {
-		wireFormat := sdktranslator.FormatCodex
-		if strings.HasPrefix(relayPath, "/v1/messages") {
-			wireFormat = sdktranslator.FormatClaude
+		if isImagePath(relayPath) {
+			body, headers, errParse = normalizeImageBody(body, req.Headers, "")
+		} else {
+			wireFormat := sdktranslator.FormatCodex
+			if strings.HasPrefix(relayPath, "/v1/messages") {
+				wireFormat = sdktranslator.FormatClaude
+			}
+			model := modelFromJSON(body)
+			body, errParse = normalizeHTTPRequestBody(body, model, wireFormat, claudeShape(client, model))
 		}
-		model := modelFromJSON(body)
-		body, errParse = normalizeHTTPRequestBody(body, model, wireFormat, claudeShape(client, model))
 		if errParse != nil {
 			return pluginapi.ExecutorHTTPResponse{}, errParse
 		}
 	}
-	headers := cloneHeaders(req.Headers)
+	if headers == nil {
+		headers = cloneHeaders(req.Headers)
+	}
 	if strings.HasPrefix(relayPath, "/v1/messages") && thinkingpkg.ParseModel(modelFromJSON(req.Body)).LongContext {
 		addLongContextBeta(headers)
 	}
@@ -202,6 +216,10 @@ func normalizeRelayPath(requestPath string) string {
 		return "/v1/responses/compact"
 	case "/backend-api/codex/alpha/search", "/v1/alpha/search":
 		return "/v1/alpha/search"
+	case "/backend-api/codex/images/generations", "/v1/images/generations":
+		return "/v1/images/generations"
+	case "/backend-api/codex/images/edits", "/v1/images/edits":
+		return "/v1/images/edits"
 	default:
 		return requestPath
 	}

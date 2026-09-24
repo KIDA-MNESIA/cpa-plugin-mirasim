@@ -214,7 +214,7 @@ func (c *Client) relayMetadataLocked(ctx context.Context, requestPath string, bo
 }
 
 func relayAgent(requestPath string) string {
-	if strings.HasPrefix(requestPath, "/v1/responses") || strings.HasPrefix(requestPath, "/v1/alpha/search") {
+	if strings.HasPrefix(requestPath, "/v1/responses") || strings.HasPrefix(requestPath, "/v1/alpha/search") || strings.HasPrefix(requestPath, "/v1/images/") {
 		return "codex"
 	}
 	return "claude"

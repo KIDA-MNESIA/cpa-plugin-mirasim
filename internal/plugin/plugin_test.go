@@ -100,7 +100,7 @@ func TestBuildDeclaresProviderCapabilities(t *testing.T) {
 	if caps.ExecutorModelScope != pluginapi.ExecutorModelScopeOAuth {
 		t.Fatalf("executor scope = %q", caps.ExecutorModelScope)
 	}
-	if len(caps.ExecutorInputFormats) != 5 || len(caps.ExecutorOutputFormats) != 5 {
+	if len(caps.ExecutorInputFormats) != 6 || len(caps.ExecutorOutputFormats) != 6 || caps.ExecutorInputFormats[0] != "openai-image" || caps.ExecutorOutputFormats[0] != "openai-image" {
 		t.Fatalf("formats = %#v / %#v", caps.ExecutorInputFormats, caps.ExecutorOutputFormats)
 	}
 	for _, field := range built.Metadata.ConfigFields {

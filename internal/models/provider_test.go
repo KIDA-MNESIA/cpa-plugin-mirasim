@@ -110,6 +110,21 @@ func TestExposedModelsIncludesOfficialBuiltinCatalogEntries(t *testing.T) {
 	}
 }
 
+func TestImageAliasesAreRegisteredForGPTAccounts(t *testing.T) {
+	models := withImageAliases(exposedModels([]mirasim.RemoteModel{{ID: "gpt-6-astra"}}))
+	if len(models) != 1+len(imageModelIDs) {
+		t.Fatalf("image aliases missing: %#v", models)
+	}
+	for _, model := range models[1:] {
+		if model.Type != "openai-image" || len(model.SupportedOutputModalities) != 1 || model.SupportedOutputModalities[0] != "image" {
+			t.Fatalf("image metadata = %#v", model)
+		}
+	}
+	if len(withImageAliases(exposedModels([]mirasim.RemoteModel{{ID: "claude-sonnet-5"}}))) != 1 {
+		t.Fatal("image aliases were registered without a GPT entitlement")
+	}
+}
+
 // The official client's catalog pattern refuses "-paid" model IDs outright, so
 // publishing one would offer a selection it never lets a user make.
 func TestExposedModelsRefusePaidVariants(t *testing.T) {
