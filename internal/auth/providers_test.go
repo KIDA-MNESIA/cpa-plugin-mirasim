@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -44,6 +45,20 @@ func TestDiscoveredProvidersControlWhichLoginsMayStart(t *testing.T) {
 	}
 	if path := mustParseURL(t, authorizeURLOf(t, p, started)).Path; path != "/auth/oauth/gitlab/login" {
 		t.Fatalf("authorize path = %q", path)
+	}
+
+	// A rejected ?provider= names only the offered set; malformed discovery
+	// entries must never survive into the operator-facing error.
+	_, errUnsupported := start("github")
+	if errUnsupported == nil {
+		t.Fatal("unoffered provider accepted")
+	}
+	message := errUnsupported.Error()
+	if !strings.Contains(message, "gitlab, google") {
+		t.Fatalf("error = %q, want the offered set", message)
+	}
+	if strings.Contains(message, "bad") || strings.Contains(message, "<script>") {
+		t.Fatalf("malformed discovery entry survived into %q", message)
 	}
 
 	// github is only the configured default and discovery does not offer it, so

@@ -32,7 +32,7 @@ func TestRegisterManagementMountsOnlyTheLoginResources(t *testing.T) {
 	if len(registered.Routes) != 0 {
 		t.Fatalf("management routes = %#v, want none", registered.Routes)
 	}
-	expectedResources := []string{OAuthStartResource, OAuthAuthorizeResource, OAuthCallbackResource, OAuthEmailSendResource}
+	expectedResources := []string{OAuthStartResource, OAuthAuthorizeResource, OAuthCallbackResource, OAuthEmailSendResource, OAuthEmailVerifyResource}
 	if len(registered.Resources) != len(expectedResources) {
 		t.Fatalf("resources = %#v, want %d", registered.Resources, len(expectedResources))
 	}
@@ -327,6 +327,9 @@ func TestStartPageOffersEmailSignIn(t *testing.T) {
 			t.Fatalf("start page lacks %q:\n%s", want, body)
 		}
 	}
+	if strings.Contains(body, `action="/`) {
+		t.Fatal("start page used an absolute form action; it must stay under the resource prefix")
+	}
 	for _, field := range []string{emailAddressField, emailCodeField} {
 		if !strings.Contains(field, "token") {
 			t.Fatalf("email flow field %q would be logged unmasked by CPA", field)
@@ -352,10 +355,13 @@ func TestEmailSendRequestsACodeAndRendersTheCodePage(t *testing.T) {
 	if addresses := fake.sentAddresses(); len(addresses) != 1 || addresses[0] != "user@example.com" {
 		t.Fatalf("code requests = %#v, want the normalized address", addresses)
 	}
-	for _, want := range []string{`action="email/verify"`, `name="` + emailCodeField + `"`, `name="state" value="` + started.State + `"`} {
+	for _, want := range []string{`action="verify"`, `name="` + emailCodeField + `"`, `name="state" value="` + started.State + `"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("code page lacks %q:\n%s", want, body)
 		}
+	}
+	if strings.Contains(body, `action="/`) {
+		t.Fatal("code page used an absolute form action; it must stay under the resource prefix")
 	}
 	if strings.Contains(body, "user@example.com") {
 		t.Fatal("code page reflected the address")
@@ -446,6 +452,243 @@ func TestEmailSendAnswersOnlyForItsOwnPendingLogin(t *testing.T) {
 		emailAddressField: []string{"user@example.com"},
 	}); status != http.StatusConflict {
 		t.Fatalf("send on a spent login = %d", status)
+	}
+}
+
+// A mailed code completes the same session the OAuth callback completes, so
+// PollLogin's one finalize path installs the credential.
+func TestEmailVerifyCompletesTheLoginThroughPollLogin(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"user@example.com"},
+	}); status != http.StatusOK {
+		t.Fatalf("send status = %d", status)
+	}
+	status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+		"state":        []string{started.State},
+		emailCodeField: []string{"123456"},
+	})
+	if status != http.StatusOK || !strings.Contains(body, "sign-in complete") {
+		t.Fatalf("verify status = %d, body = %s", status, body)
+	}
+	if strings.Contains(body, "refresh-secret") || strings.Contains(body, "eyJ") {
+		t.Fatal("completion page reflected a credential")
+	}
+	if calls := fake.verifyCalls(); len(calls) != 1 || calls[0] != (emailVerifyCall{email: "user@example.com", code: "123456"}) {
+		t.Fatalf("verify calls = %#v", calls)
+	}
+	polled, _ := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: started.State, HTTPClient: oauthValidationClient{}})
+	if polled.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("PollLogin() = %#v", polled)
+	}
+	var payload map[string]any
+	if errJSON := json.Unmarshal(polled.Auth.StorageJSON, &payload); errJSON != nil {
+		t.Fatal(errJSON)
+	}
+	if payload["refresh_token"] != "refresh-secret" || payload["auth_kind"] != "oauth" {
+		t.Fatalf("email sign-in credential = %#v", payload)
+	}
+	if _, errParseAuth := credentials.Parse(polled.Auth.StorageJSON, provider.settings); errParseAuth != nil {
+		t.Fatalf("parse email sign-in auth JSON error = %v", errParseAuth)
+	}
+}
+
+// A verify that arrives before any code was sent has nothing to check: it
+// reaches nothing and leaves the login usable.
+func TestEmailVerifyBeforeASendSpendsNothing(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"user@example.com"},
+		emailCodeField:    []string{"123456"},
+	})
+	if status != http.StatusBadRequest || !strings.Contains(body, "No code was requested") {
+		t.Fatalf("verify before send = %d, body = %s", status, body)
+	}
+	if calls := fake.verifyCalls(); len(calls) != 0 {
+		t.Fatalf("verify before send reached Mirasim: %#v", calls)
+	}
+	if pending, _ := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: started.State}); pending.Status != pluginapi.AuthLoginStatusPending {
+		t.Fatalf("verify before send spent the login: %#v", pending)
+	}
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"user@example.com"},
+	}); status != http.StatusOK {
+		t.Fatalf("send status = %d", status)
+	}
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+		"state":        []string{started.State},
+		emailCodeField: []string{"123456"},
+	}); status != http.StatusOK {
+		t.Fatalf("verify after send = %d", status)
+	}
+}
+
+// A wrong code spends one attempt and leaves the login pending so the operator
+// can retype it.
+func TestWrongEmailCodeLeavesTheLoginPending(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"user@example.com"},
+	}); status != http.StatusOK {
+		t.Fatalf("send status = %d", status)
+	}
+	fake.rejectCodes()
+	status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+		"state":        []string{started.State},
+		emailCodeField: []string{"000000"},
+	})
+	if status != http.StatusBadRequest || !strings.Contains(body, "not accepted") {
+		t.Fatalf("wrong code = %d, body = %s", status, body)
+	}
+	if strings.Contains(body, "000000") {
+		t.Fatal("retry page reflected the submitted code")
+	}
+	if !strings.Contains(body, `action="verify"`) {
+		t.Fatal("retry page has no relative code form to retype into")
+	}
+	if pending, _ := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: started.State}); pending.Status != pluginapi.AuthLoginStatusPending {
+		t.Fatalf("wrong code spent the login: %#v", pending)
+	}
+	fake.acceptCodes()
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+		"state":        []string{started.State},
+		emailCodeField: []string{"123456"},
+	}); status != http.StatusOK {
+		t.Fatalf("verify after a wrong code = %d", status)
+	}
+	if polled, _ := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: started.State, HTTPClient: oauthValidationClient{}}); polled.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("PollLogin() = %#v", polled)
+	}
+}
+
+// The verify request cannot name the address: the one stored at send is the one
+// Mirasim checks the code against.
+func TestEmailVerifyUsesTheAddressStoredAtSend(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"real@example.com"},
+	}); status != http.StatusOK {
+		t.Fatalf("send status = %d", status)
+	}
+	status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"attacker@example.com"},
+		emailCodeField:    []string{"123456"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("verify status = %d", status)
+	}
+	if calls := fake.verifyCalls(); len(calls) != 1 || calls[0].email != "real@example.com" {
+		t.Fatalf("verify calls = %#v, want the address stored at send", calls)
+	}
+}
+
+// An exhausted attempt budget fails the login, and PollLogin reports it.
+func TestEmailVerifyAttemptsAreBoundedAndExhaustTheLogin(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"user@example.com"},
+	}); status != http.StatusOK {
+		t.Fatalf("send status = %d", status)
+	}
+	fake.rejectCodes()
+	for attempt := 1; attempt <= maxEmailVerifyAttempts; attempt++ {
+		status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+			"state":        []string{started.State},
+			emailCodeField: []string{"bad-code"},
+		})
+		if attempt < maxEmailVerifyAttempts {
+			if status != http.StatusBadRequest || !strings.Contains(body, "not accepted") {
+				t.Fatalf("attempt %d = %d, body = %s", attempt, status, body)
+			}
+			if pending, _ := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: started.State}); pending.Status != pluginapi.AuthLoginStatusPending {
+				t.Fatalf("attempt %d ended the login: %#v", attempt, pending)
+			}
+			continue
+		}
+		if status != http.StatusBadRequest || !strings.Contains(body, "Too many code attempts") {
+			t.Fatalf("exhausting attempt = %d, body = %s", status, body)
+		}
+	}
+	if calls := fake.verifyCalls(); len(calls) != maxEmailVerifyAttempts {
+		t.Fatalf("verify calls = %d, want %d", len(calls), maxEmailVerifyAttempts)
+	}
+	polled, _ := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: started.State})
+	if polled.Status != pluginapi.AuthLoginStatusError || !strings.Contains(polled.Message, "too many code attempts") {
+		t.Fatalf("PollLogin() = %#v", polled)
+	}
+	// The failed login refuses another code without spending an attempt.
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailVerifyResource, url.Values{
+		"state":        []string{started.State},
+		emailCodeField: []string{"123456"},
+	}); status != http.StatusConflict {
+		t.Fatalf("verify on a failed login = %d", status)
+	}
+	if calls := fake.verifyCalls(); len(calls) != maxEmailVerifyAttempts {
+		t.Fatalf("a verify on a failed login reached Mirasim: %#v", calls)
+	}
+}
+
+// Both email routes answer only for the pending login's own state.
+func TestEmailRoutesAnswerOnlyForTheirOwnPendingLogin(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	emailQuery := func(state string) url.Values {
+		return url.Values{
+			"state":           []string{state},
+			emailAddressField: []string{"user@example.com"},
+			emailCodeField:    []string{"123456"},
+		}
+	}
+	for _, route := range []string{OAuthEmailSendResource, OAuthEmailVerifyResource} {
+		for _, state := range []string{"", "not-a-session"} {
+			if status, _ := serveCallback(t, provider, testResourceBasePath+route, emailQuery(state)); status != http.StatusBadRequest {
+				t.Fatalf("%s for state %q = %d", route, state, status)
+			}
+		}
+	}
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	if status, _ := deliverCallback(t, provider, callbackAddressOf(t, provider, started), url.Values{
+		"access_token":  []string{identityJWT("account-1", "", time.Now().Add(time.Hour))},
+		"refresh_token": []string{"refresh-secret"},
+	}); status != http.StatusOK {
+		t.Fatalf("callback status = %d", status)
+	}
+	for _, route := range []string{OAuthEmailSendResource, OAuthEmailVerifyResource} {
+		if status, _ := serveCallback(t, provider, testResourceBasePath+route, emailQuery(started.State)); status != http.StatusConflict {
+			t.Fatalf("%s on a spent login = %d", route, status)
+		}
+	}
+	if len(fake.sentAddresses()) != 0 || len(fake.verifyCalls()) != 0 {
+		t.Fatalf("gated requests reached Mirasim: sent %#v, verified %#v", fake.sentAddresses(), fake.verifyCalls())
 	}
 }
 
@@ -1067,15 +1310,20 @@ func serveCallback(t *testing.T, provider *Provider, path string, query url.Valu
 	return resp.StatusCode, string(resp.Body)
 }
 
+type emailVerifyCall struct {
+	email string
+	code  string
+}
+
 // emailAuthFake is the fake Mirasim authentication service behind the browser
 // email-code tests. It records code requests and, unless reject is set, answers
 // verification with renewable credentials.
 type emailAuthFake struct {
-	t      *testing.T
-	mu     sync.Mutex
-	sent   []string
-	codes  []string
-	reject bool
+	t        *testing.T
+	mu       sync.Mutex
+	sent     []string
+	verified []emailVerifyCall
+	reject   bool
 }
 
 func (f *emailAuthFake) rejectCodes() {
@@ -1096,10 +1344,10 @@ func (f *emailAuthFake) sentAddresses() []string {
 	return append([]string(nil), f.sent...)
 }
 
-func (f *emailAuthFake) verifiedCodes() []string {
+func (f *emailAuthFake) verifyCalls() []emailVerifyCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]string(nil), f.codes...)
+	return append([]emailVerifyCall(nil), f.verified...)
 }
 
 func (f *emailAuthFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1113,11 +1361,15 @@ func (f *emailAuthFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.sent = append(f.sent, body["email"])
 		f.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]string{})
+	case r.URL.Path == "/auth/me" && r.Method == http.MethodGet:
+		// finalizeOAuthStorage treats the plan-state refresh as best-effort, so
+		// answer it the way the real service would.
+		_ = json.NewEncoder(w).Encode(map[string]string{"email": "user@example.com"})
 	case r.URL.Path == emailVerifyResource && r.Method == http.MethodPost:
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.mu.Lock()
-		f.codes = append(f.codes, body["code"])
+		f.verified = append(f.verified, emailVerifyCall{email: body["email"], code: body["code"]})
 		reject := f.reject
 		f.mu.Unlock()
 		if reject {

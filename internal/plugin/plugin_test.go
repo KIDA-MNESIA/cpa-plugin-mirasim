@@ -73,7 +73,7 @@ func TestBuildDeclaresProviderCapabilities(t *testing.T) {
 	}
 	// Named so the email sign-in task only adds its routes here; the quota page
 	// is matched by prefix because its path carries a random segment.
-	expectedResources := []string{"/oauth/start", "/oauth/authorize", "/oauth/callback"}
+	expectedResources := []string{"/oauth/start", "/oauth/authorize", "/oauth/callback", "/oauth/email/send", "/oauth/email/verify"}
 	paths := make(map[string]pluginapi.ResourceRoute, len(registered.Resources))
 	for _, resource := range registered.Resources {
 		paths[resource.Path] = resource

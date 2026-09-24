@@ -61,6 +61,10 @@ const (
 	// the start page's email form submits to: it asks Mirasim to mail a sign-in
 	// code to the address the form carries.
 	OAuthEmailSendResource = "/oauth/email/send"
+	// OAuthEmailVerifyResource is the resource route, under the same prefix, that
+	// the code-entry page's form submits to: it exchanges the mailed code for
+	// credentials on the same login session.
+	OAuthEmailVerifyResource = "/oauth/email/verify"
 	// fallbackLoginProvider is the last resort when neither the caller nor the
 	// configuration names a Mirasim sign-in provider.
 	fallbackLoginProvider = "github"
@@ -133,6 +137,7 @@ func (p *Provider) RegisterManagement(_ context.Context, req pluginapi.Managemen
 		{Path: OAuthAuthorizeResource, Description: "Redirects to the chosen Mirasim sign-in provider.", Handler: p},
 		{Path: OAuthCallbackResource, Description: "Receives a Mirasim browser OAuth callback.", Handler: p},
 		{Path: OAuthEmailSendResource, Description: "Mails a Mirasim sign-in code to the address entered on the start page.", Handler: p},
+		{Path: OAuthEmailVerifyResource, Description: "Verifies a Mirasim emailed sign-in code and completes the login.", Handler: p},
 	}}, nil
 }
 
@@ -167,6 +172,8 @@ func (p *Provider) HandleManagement(ctx context.Context, req pluginapi.Managemen
 		return callbackPageResponse(status, page), nil
 	case basePath + OAuthEmailSendResource:
 		return p.handleOAuthEmailSend(ctx, req), nil
+	case basePath + OAuthEmailVerifyResource:
+		return p.handleOAuthEmailVerify(ctx, req), nil
 	default:
 		return callbackPageResponse(http.StatusNotFound, callbackNotFoundPage), nil
 	}
@@ -336,7 +343,74 @@ func (p *Provider) handleOAuthEmailSend(ctx context.Context, req pluginapi.Manag
 	if errSend := requestEmailCode(ctx, p.settings.AdminURL, proxyURL, address); errSend != nil {
 		return callbackPageResponse(http.StatusBadGateway, emailSendFailedPage)
 	}
-	return emailCodePageResponse(state, false)
+	return emailCodePageResponse(state, http.StatusOK, false)
+}
+
+// handleOAuthEmailVerify exchanges the code entered on the code page for
+// credentials and latches them on the session exactly where the OAuth callback
+// latches its own, so PollLogin's single finalize path installs them unchanged.
+// The address comes from the session, never from this request, so the route
+// cannot be aimed at addresses the caller did not have Mirasim mail. A wrong
+// code costs one attempt and leaves the login pending; an exhausted budget
+// fails it so PollLogin reports the failure.
+func (p *Provider) handleOAuthEmailVerify(ctx context.Context, req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	state := strings.TrimSpace(req.Query.Get("state"))
+
+	p.oauth.mu.Lock()
+	p.oauth.purgeLocked(p.oauth.now())
+	session := p.oauth.sessions[state]
+	if state == "" || session == nil || !constantTimeEqual(session.state, state) {
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusBadRequest, startExpiredPage)
+	}
+	if session.callbackDone || session.auth != nil {
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusConflict, callbackUsedPage)
+	}
+	// Verification without a send on this login has nothing to check, so it
+	// answers without spending the login or reaching Mirasim.
+	if session.emailSends == 0 || session.email == "" {
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusBadRequest, emailNoCodePage)
+	}
+	code, errCode := normalizeLoginCode(req.Query.Get(emailCodeField))
+	if errCode != nil {
+		p.oauth.mu.Unlock()
+		return emailCodePageResponse(state, http.StatusBadRequest, true)
+	}
+	address, proxyURL := session.email, session.proxyURL
+	p.oauth.mu.Unlock()
+
+	accessToken, refreshToken, errVerify := verifyEmailCode(ctx, p.settings.AdminURL, proxyURL, address, code)
+	code = ""
+
+	p.oauth.mu.Lock()
+	defer p.oauth.mu.Unlock()
+	session = p.oauth.sessions[state]
+	if session == nil || !constantTimeEqual(session.state, state) {
+		return callbackPageResponse(http.StatusBadRequest, startExpiredPage)
+	}
+	if session.callbackDone || session.auth != nil {
+		accessToken, refreshToken = "", ""
+		return callbackPageResponse(http.StatusConflict, callbackUsedPage)
+	}
+	if errVerify != nil {
+		accessToken, refreshToken = "", ""
+		session.emailAttempts++
+		if session.emailAttempts >= maxEmailVerifyAttempts {
+			// The budget is spent, so this is a failed login rather than a typo:
+			// latch the failure the way a rejected callback does and let
+			// PollLogin report it on the next poll.
+			session.callbackDone = true
+			session.errorMessage = "Mirasim email sign-in failed: too many code attempts"
+			return callbackPageResponse(http.StatusBadRequest, emailAttemptsPage)
+		}
+		return emailCodePageResponse(state, http.StatusBadRequest, true)
+	}
+	session.callbackDone = true
+	session.accessToken = accessToken
+	session.refreshToken = refreshToken
+	return callbackPageResponse(http.StatusOK, callbackCompletePage)
 }
 
 func (p *Provider) PollLogin(ctx context.Context, req pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {

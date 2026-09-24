@@ -79,11 +79,7 @@ func (c *oauthCoordinator) startPage(state string) pluginapi.ManagementResponse 
 	if errRender := startPageTemplate.Execute(&body, data); errRender != nil {
 		return callbackPageResponse(http.StatusInternalServerError, callbackNotFoundPage)
 	}
-	headers := browserHeaders(nil)
-	// The paste form submits to the callback on this same origin; nothing else
-	// the default policy forbids is loosened.
-	headers.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
-	return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: headers, Body: body.Bytes()}
+	return formPageResponse(http.StatusOK, body.Bytes())
 }
 
 type startPageData struct {
@@ -136,21 +132,21 @@ var startPageTemplate = template.Must(template.New("start").Parse(`<!doctype htm
 // emailCodePageResponse renders the code-entry form for one login. Only the
 // login's own state is placed in it, so neither the address nor the code ever
 // reaches the browser through the page.
-func emailCodePageResponse(state string, retry bool) pluginapi.ManagementResponse {
+func emailCodePageResponse(state string, status int, retry bool) pluginapi.ManagementResponse {
 	var body bytes.Buffer
 	data := emailCodePageData{State: state, Field: emailCodeField, Retry: retry, Minutes: int(oauthLoginTTL.Minutes())}
 	if errRender := emailCodePageTemplate.Execute(&body, data); errRender != nil {
 		return callbackPageResponse(http.StatusInternalServerError, callbackNotFoundPage)
 	}
-	return formPageResponse(body.Bytes())
+	return formPageResponse(status, body.Bytes())
 }
 
 // formPageResponse serves a page whose form submits back to this same origin.
 // The policy stays as tight as the fixed callback pages except for that action.
-func formPageResponse(body []byte) pluginapi.ManagementResponse {
+func formPageResponse(status int, body []byte) pluginapi.ManagementResponse {
 	headers := browserHeaders(nil)
 	headers.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
-	return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: headers, Body: body}
+	return pluginapi.ManagementResponse{StatusCode: status, Headers: headers, Body: body}
 }
 
 type emailCodePageData struct {
@@ -172,7 +168,7 @@ var emailCodePageTemplate = template.Must(template.New("email-code").Parse(`<!do
 	`<p>如果该邮箱已有 Mirasim 账号，验证码已发送。请在下方输入。</p>` +
 	`<p class="en">If that address has a Mirasim account, a sign-in code was mailed to it. Enter it below.</p>` +
 	`{{if .Retry}}<p class="notice">验证码未通过，请重试。</p><p class="en notice">That code was not accepted. Try again.</p>{{end}}` +
-	`<form method="get" action="email/verify"><input type="hidden" name="state" value="{{.State}}"><input type="text" name="{{.Field}}" required autocomplete="one-time-code" inputmode="numeric" spellcheck="false" placeholder="123456">` +
+	`<form method="get" action="verify"><input type="hidden" name="state" value="{{.State}}"><input type="text" name="{{.Field}}" required autocomplete="one-time-code" inputmode="numeric" spellcheck="false" placeholder="123456">` +
 	`<button type="submit">完成登录 / Verify code</button></form>` +
 	`<p>本次登录 {{.Minutes}} 分钟内有效。</p><p class="en">This sign-in expires {{.Minutes}} minutes after it was started.</p>` +
 	`</body></html>`))
