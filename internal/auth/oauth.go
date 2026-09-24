@@ -32,6 +32,19 @@ const (
 	// tells the plugin when Management Center abandons a login, so the oldest one
 	// is dropped to make room rather than refusing the next.
 	maxOAuthSessions = 8
+	// maxEmailCodeSends bounds how many codes one pending login may ask Mirasim
+	// to mail. The send route is unauthenticated and a state is all a caller
+	// needs, so three requests keep the route useless as a mail relay.
+	maxEmailCodeSends = 3
+	// emailCodeSendInterval is the minimum wait between two code requests on one
+	// login. Mail arrives in minutes, not seconds, so a shorter interval would
+	// only duplicate messages; it also caps a relay at one message a minute per
+	// pending login.
+	emailCodeSendInterval = 60 * time.Second
+	// maxEmailVerifyAttempts bounds wrong codes on one login before the login is
+	// failed. Mirasim codes are short, so a small budget is a poor oracle yet
+	// still leaves room for typos and a slow mail delivery.
+	maxEmailVerifyAttempts = 5
 	// OAuthStartResource is the resource route, under the plugin's resource
 	// prefix on CPA's own port, that Management Center's "open link" button
 	// opens: it lists the sign-in providers and takes the callback URL pasted
@@ -44,6 +57,10 @@ const (
 	// OAuthCallbackResource is the resource route, under the same prefix, that
 	// receives the Mirasim browser callback.
 	OAuthCallbackResource = "/oauth/callback"
+	// OAuthEmailSendResource is the resource route, under the same prefix, that
+	// the start page's email form submits to: it asks Mirasim to mail a sign-in
+	// code to the address the form carries.
+	OAuthEmailSendResource = "/oauth/email/send"
 	// fallbackLoginProvider is the last resort when neither the caller nor the
 	// configuration names a Mirasim sign-in provider.
 	fallbackLoginProvider = "github"
@@ -61,15 +78,26 @@ type oauthSession struct {
 	// the offered providers matches the configured or requested one.
 	defaultProvider string
 	// provider is the offered provider the browser chose, empty until then.
-	provider     string
-	callbackURL  string
-	expiresAt    time.Time
-	accessToken  string
-	refreshToken string
-	callbackDone bool
-	finalizing   bool
-	errorMessage string
-	auth         *pluginapi.AuthData
+	provider string
+	// proxyURL is the host proxy Mirasim calls go through, captured at
+	// StartLogin because resource handlers get no host services.
+	proxyURL string
+	// email is the address a code was sent to. Verify reads it from here, never
+	// from its own request, so the route cannot be pointed at other addresses.
+	email string
+	// emailSentAt and emailSends rate limit the send route on this login.
+	emailSentAt time.Time
+	emailSends  int
+	// emailAttempts counts wrong codes tried against this login.
+	emailAttempts int
+	callbackURL   string
+	expiresAt     time.Time
+	accessToken   string
+	refreshToken  string
+	callbackDone  bool
+	finalizing    bool
+	errorMessage  string
+	auth          *pluginapi.AuthData
 }
 
 type oauthCoordinator struct {
@@ -104,6 +132,7 @@ func (p *Provider) RegisterManagement(_ context.Context, req pluginapi.Managemen
 		{Path: OAuthStartResource, Description: "Starts a Mirasim browser OAuth login.", Handler: p},
 		{Path: OAuthAuthorizeResource, Description: "Redirects to the chosen Mirasim sign-in provider.", Handler: p},
 		{Path: OAuthCallbackResource, Description: "Receives a Mirasim browser OAuth callback.", Handler: p},
+		{Path: OAuthEmailSendResource, Description: "Mails a Mirasim sign-in code to the address entered on the start page.", Handler: p},
 	}}, nil
 }
 
@@ -111,7 +140,7 @@ func (p *Provider) RegisterManagement(_ context.Context, req pluginapi.Managemen
 // callback. CPA does not authenticate resource routes, so every one of them
 // answers only for the state of a pending login, the callback is accepted only
 // once, and no response ever reflects a credential or any part of one.
-func (p *Provider) HandleManagement(_ context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
+func (p *Provider) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
 	p.oauth.mu.Lock()
 	basePath := p.oauth.resourceBasePath
 	p.oauth.mu.Unlock()
@@ -136,6 +165,8 @@ func (p *Provider) HandleManagement(_ context.Context, req pluginapi.ManagementR
 		}
 		status, page := p.oauth.acceptCallback(oauthResultFromValues(req.Query))
 		return callbackPageResponse(status, page), nil
+	case basePath + OAuthEmailSendResource:
+		return p.handleOAuthEmailSend(ctx, req), nil
 	default:
 		return callbackPageResponse(http.StatusNotFound, callbackNotFoundPage), nil
 	}
@@ -202,6 +233,7 @@ func (p *Provider) StartLogin(ctx context.Context, req pluginapi.AuthLoginStartR
 		state:           state,
 		providers:       offered,
 		defaultProvider: defaultProvider,
+		proxyURL:        req.Host.ProxyURL,
 		callbackURL:     callbackURL.String(),
 		expiresAt:       expiresAt,
 	}
@@ -260,6 +292,51 @@ func (p *Provider) handleOAuthAuthorize(req pluginapi.ManagementRequest) plugina
 		StatusCode: http.StatusFound,
 		Headers:    browserHeaders(http.Header{"Location": []string{authURL}}),
 	}
+}
+
+// handleOAuthEmailSend mails a sign-in code for the pending login named by the
+// request's state. The address travels in the page's form, is stored on the
+// session for the verify step, and is never reflected back into a response. A
+// resource handler gets no host services, so the outbound call goes through the
+// proxy recorded when the login started.
+func (p *Provider) handleOAuthEmailSend(ctx context.Context, req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	state := strings.TrimSpace(req.Query.Get("state"))
+
+	p.oauth.mu.Lock()
+	p.oauth.purgeLocked(p.oauth.now())
+	session := p.oauth.sessions[state]
+	if state == "" || session == nil || !constantTimeEqual(session.state, state) {
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusBadRequest, startExpiredPage)
+	}
+	if session.callbackDone || session.auth != nil {
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusConflict, callbackUsedPage)
+	}
+	now := p.oauth.now()
+	if session.emailSends >= maxEmailCodeSends || (!session.emailSentAt.IsZero() && now.Sub(session.emailSentAt) < emailCodeSendInterval) {
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusTooManyRequests, emailCodeLimitedPage)
+	}
+	address, errAddress := normalizeLoginEmail(req.Query.Get(emailAddressField))
+	if errAddress != nil {
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusBadRequest, emailAddressPage)
+	}
+	// Spend the send before the outbound call: the request leaves this process
+	// even when Mirasim rejects it, so only counting successes would leave the
+	// relay unbounded. Doing it under the lock that checked the interval also
+	// turns two concurrent submits into one send.
+	session.emailSends++
+	session.emailSentAt = now
+	session.email = address
+	proxyURL := session.proxyURL
+	p.oauth.mu.Unlock()
+
+	if errSend := requestEmailCode(ctx, p.settings.AdminURL, proxyURL, address); errSend != nil {
+		return callbackPageResponse(http.StatusBadGateway, emailSendFailedPage)
+	}
+	return emailCodePageResponse(state, false)
 }
 
 func (p *Provider) PollLogin(ctx context.Context, req pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {

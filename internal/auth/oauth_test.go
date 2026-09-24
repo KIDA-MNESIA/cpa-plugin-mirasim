@@ -32,8 +32,14 @@ func TestRegisterManagementMountsOnlyTheLoginResources(t *testing.T) {
 	if len(registered.Routes) != 0 {
 		t.Fatalf("management routes = %#v, want none", registered.Routes)
 	}
-	if len(registered.Resources) != 3 || registered.Resources[0].Path != OAuthStartResource || registered.Resources[1].Path != OAuthAuthorizeResource || registered.Resources[2].Path != OAuthCallbackResource {
-		t.Fatalf("resources = %#v", registered.Resources)
+	expectedResources := []string{OAuthStartResource, OAuthAuthorizeResource, OAuthCallbackResource, OAuthEmailSendResource}
+	if len(registered.Resources) != len(expectedResources) {
+		t.Fatalf("resources = %#v, want %d", registered.Resources, len(expectedResources))
+	}
+	for i, path := range expectedResources {
+		if registered.Resources[i].Path != path {
+			t.Fatalf("resource %d = %q, want %q", i, registered.Resources[i].Path, path)
+		}
 	}
 	for _, resource := range registered.Resources {
 		if resource.Handler == nil {
@@ -300,6 +306,146 @@ func TestAMistakenPasteLeavesTheLoginWaiting(t *testing.T) {
 		if polled, _ := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: started.State}); polled.Status != pluginapi.AuthLoginStatusPending {
 			t.Fatalf("%s paste ended the login: %#v", name, polled)
 		}
+	}
+}
+
+// The start page carries an email sign-in next to the provider buttons, and its
+// address field is named so CPA's request log masks the value.
+func TestStartPageOffersEmailSignIn(t *testing.T) {
+	provider, _ := newLoginProvider(t, pluginconfig.Defaults())
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	page := serveStartPage(t, provider, started.State)
+	if page.StatusCode != http.StatusOK {
+		t.Fatalf("start page status = %d", page.StatusCode)
+	}
+	body := string(page.Body)
+	for _, want := range []string{`action="email/send"`, `name="` + emailAddressField + `"`, `name="state" value="` + started.State + `"`, "Email me a code"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("start page lacks %q:\n%s", want, body)
+		}
+	}
+	for _, field := range []string{emailAddressField, emailCodeField} {
+		if !strings.Contains(field, "token") {
+			t.Fatalf("email flow field %q would be logged unmasked by CPA", field)
+		}
+	}
+}
+
+// Sending a code posts the address to Mirasim through the login's captured
+// proxy and answers with the code form, never with the address.
+func TestEmailSendRequestsACodeAndRendersTheCodePage(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"  user@example.com  "},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("send status = %d, body = %s", status, body)
+	}
+	if addresses := fake.sentAddresses(); len(addresses) != 1 || addresses[0] != "user@example.com" {
+		t.Fatalf("code requests = %#v, want the normalized address", addresses)
+	}
+	for _, want := range []string{`action="email/verify"`, `name="` + emailCodeField + `"`, `name="state" value="` + started.State + `"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("code page lacks %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "user@example.com") {
+		t.Fatal("code page reflected the address")
+	}
+}
+
+// One pending login may ask for at most maxEmailCodeSends codes, one interval
+// apart, so the unauthenticated route cannot be used as a mail relay.
+func TestEmailSendIsRateLimitedPerLogin(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	provider.oauth.now = func() time.Time { return now }
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	send := func() int {
+		status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+			"state":           []string{started.State},
+			emailAddressField: []string{"user@example.com"},
+		})
+		return status
+	}
+	if status := send(); status != http.StatusOK {
+		t.Fatalf("first send = %d", status)
+	}
+	if status := send(); status != http.StatusTooManyRequests {
+		t.Fatalf("immediate second send = %d, want the interval limit", status)
+	}
+	now = now.Add(emailCodeSendInterval)
+	if status := send(); status != http.StatusOK {
+		t.Fatalf("send after the interval = %d", status)
+	}
+	now = now.Add(emailCodeSendInterval)
+	if status := send(); status != http.StatusOK {
+		t.Fatalf("third send = %d", status)
+	}
+	now = now.Add(emailCodeSendInterval)
+	if status := send(); status != http.StatusTooManyRequests {
+		t.Fatalf("fourth send = %d, want the count limit", status)
+	}
+	if addresses := fake.sentAddresses(); len(addresses) != maxEmailCodeSends {
+		t.Fatalf("code requests = %d, want %d", len(addresses), maxEmailCodeSends)
+	}
+}
+
+func TestEmailSendAnswersOnlyForItsOwnPendingLogin(t *testing.T) {
+	provider, fake := newEmailLoginProvider(t)
+	for _, state := range []string{"", "not-a-session"} {
+		status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+			"state":           []string{state},
+			emailAddressField: []string{"user@example.com"},
+		})
+		if status != http.StatusBadRequest {
+			t.Fatalf("send for state %q = %d", state, status)
+		}
+	}
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	// A malformed address is the operator's slip: it spends nothing and does
+	// not reach Mirasim.
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"not-an-address"},
+	}); status != http.StatusBadRequest {
+		t.Fatalf("malformed address send = %d", status)
+	}
+	if addresses := fake.sentAddresses(); len(addresses) != 0 {
+		t.Fatalf("malformed address reached Mirasim: %#v", addresses)
+	}
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"user@example.com"},
+	}); status != http.StatusOK {
+		t.Fatalf("send after a slip = %d", status)
+	}
+	// A login already spent on the callback refuses the email send too.
+	if status, _ := deliverCallback(t, provider, callbackAddressOf(t, provider, started), url.Values{
+		"access_token":  []string{identityJWT("account-1", "", time.Now().Add(time.Hour))},
+		"refresh_token": []string{"refresh-secret"},
+	}); status != http.StatusOK {
+		t.Fatalf("callback status = %d", status)
+	}
+	if status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+		"state":           []string{started.State},
+		emailAddressField: []string{"user@example.com"},
+	}); status != http.StatusConflict {
+		t.Fatalf("send on a spent login = %d", status)
 	}
 }
 
@@ -919,6 +1065,90 @@ func serveCallback(t *testing.T, provider *Provider, path string, query url.Valu
 		t.Fatalf("callback headers = %#v", resp.Headers)
 	}
 	return resp.StatusCode, string(resp.Body)
+}
+
+// emailAuthFake is the fake Mirasim authentication service behind the browser
+// email-code tests. It records code requests and, unless reject is set, answers
+// verification with renewable credentials.
+type emailAuthFake struct {
+	t      *testing.T
+	mu     sync.Mutex
+	sent   []string
+	codes  []string
+	reject bool
+}
+
+func (f *emailAuthFake) rejectCodes() {
+	f.mu.Lock()
+	f.reject = true
+	f.mu.Unlock()
+}
+
+func (f *emailAuthFake) acceptCodes() {
+	f.mu.Lock()
+	f.reject = false
+	f.mu.Unlock()
+}
+
+func (f *emailAuthFake) sentAddresses() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.sent...)
+}
+
+func (f *emailAuthFake) verifiedCodes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.codes...)
+}
+
+func (f *emailAuthFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.URL.Path == "/auth/oauth/providers" && r.Method == http.MethodGet:
+		_, _ = w.Write([]byte(`{"providers":["github","google"]}`))
+	case r.URL.Path == emailCodeResource && r.Method == http.MethodPost:
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.sent = append(f.sent, body["email"])
+		f.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]string{})
+	case r.URL.Path == emailVerifyResource && r.Method == http.MethodPost:
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.codes = append(f.codes, body["code"])
+		reject := f.reject
+		f.mu.Unlock()
+		if reject {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"detail":"invalid code"}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  identityJWT("account-email", "user@example.com", time.Now().Add(time.Hour)),
+			"refresh_token": "refresh-secret",
+		})
+	default:
+		f.t.Errorf("unexpected Mirasim request %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+// newEmailLoginProvider wires a provider to an emailAuthFake and registers its
+// resources the way CPA does at load.
+func newEmailLoginProvider(t *testing.T) (*Provider, *emailAuthFake) {
+	t.Helper()
+	fake := &emailAuthFake{t: t}
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+	settings := pluginconfig.Defaults()
+	settings.AdminURL = server.URL
+	provider := New(settings, mirasim.NewPool())
+	if _, errRegister := provider.RegisterManagement(context.Background(), pluginapi.ManagementRegistrationRequest{ResourceBasePath: testResourceBasePath}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	return provider, fake
 }
 
 func newOAuthProfileServer(t *testing.T) *httptest.Server {
