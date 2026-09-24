@@ -107,10 +107,10 @@ func (p *Provider) RegisterManagement(_ context.Context, req pluginapi.Managemen
 	}}, nil
 }
 
-// HandleManagement serves the start page and the OAuth callback. CPA does not
-// authenticate resource routes, so both answer only for the state of a pending
-// login, the callback is accepted only once, and no response ever reflects a
-// credential or any part of one.
+// HandleManagement serves the start page, the provider redirect and the OAuth
+// callback. CPA does not authenticate resource routes, so every one of them
+// answers only for the state of a pending login, the callback is accepted only
+// once, and no response ever reflects a credential or any part of one.
 func (p *Provider) HandleManagement(_ context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
 	p.oauth.mu.Lock()
 	basePath := p.oauth.resourceBasePath
