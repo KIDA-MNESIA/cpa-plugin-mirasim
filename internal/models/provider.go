@@ -22,6 +22,9 @@ var fallbackModelIDs = []string{
 	"gpt-5.6-luna",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
+	"deepseek-flash",
+	"glm-5.3-flash",
+	"kimi-k3",
 }
 
 type modelDefinition struct {
@@ -104,6 +107,24 @@ var modelDefinitions = map[string]modelDefinition{
 		displayName: "GPT 5.6 Terra", version: "gpt-5.6", created: 1783616400, context: 372000, output: 128000,
 		description: "Balanced OpenAI agentic coding model via Mirasim",
 		methods:     []string{"responses"}, parameters: []string{"tools", "thinking"}, thinking: codexThinking(), modelType: "openai", owner: "openai",
+	},
+	"deepseek-flash": {
+		displayName: "DeepSeek V4.1 Flash", context: 1000000, output: 384000,
+		description: "DeepSeek Flash via Mirasim",
+		methods:     []string{"messages", "countTokens"}, parameters: []string{"max_tokens", "stop_sequences", "tools", "tool_choice", "thinking", "output_config"},
+		thinking: &pluginapi.ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true, Levels: []string{"off", "low", "high", "max"}}, modelType: "deepseek", owner: "deepseek",
+	},
+	"glm-5.3-flash": {
+		displayName: "GLM 5.3 Flash", context: 1000000,
+		description: "GLM 5.3 Flash via Mirasim",
+		methods:     []string{"messages", "countTokens"}, parameters: []string{"max_tokens", "stop_sequences", "tools", "tool_choice", "thinking", "output_config"},
+		thinking: &pluginapi.ThinkingSupport{DynamicAllowed: true, Levels: []string{"low", "high", "max"}}, modelType: "glm", owner: "z-ai",
+	},
+	"kimi-k3": {
+		displayName: "Kimi K3", context: 1048576,
+		description: "Kimi K3 via Mirasim",
+		methods:     []string{"messages", "countTokens"}, parameters: []string{"max_tokens", "stop_sequences", "tools", "tool_choice", "thinking", "output_config"},
+		thinking: &pluginapi.ThinkingSupport{DynamicAllowed: true, Levels: []string{"low", "high", "max"}}, modelType: "kimi", owner: "moonshot",
 	},
 }
 
@@ -194,15 +215,14 @@ func applyCatalogContexts(models []pluginapi.ModelInfo, catalog []mirasim.Remote
 	}
 }
 
-// isExposedModel keeps the families this plugin has a wire for: Claude goes to
-// Messages and GPT to Responses. The official client hides the other families
-// the relay lists from its own picker, so nothing servable is withheld here.
+// GPT uses Responses; the other relay models use the Messages wire.
 func isExposedModel(id string) bool {
 	id = strings.ToLower(strings.TrimSpace(id))
 	if mirasim.PaidVariantModel(id) {
 		return false
 	}
-	return strings.HasPrefix(id, "claude-") || strings.HasPrefix(id, "gpt-")
+	return strings.HasPrefix(id, "claude-") || strings.HasPrefix(id, "gpt-") ||
+		strings.HasPrefix(id, "deepseek-") || strings.HasPrefix(id, "glm-") || strings.HasPrefix(id, "kimi-")
 }
 
 func modelInfo(id, object string, created int64, owner string) pluginapi.ModelInfo {
@@ -246,9 +266,19 @@ func modelInfo(id, object string, created int64, owner string) pluginapi.ModelIn
 }
 
 func genericDefinition(id string) modelDefinition {
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(id)), "claude-") {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if strings.HasPrefix(id, "claude-") || strings.HasPrefix(id, "deepseek-") || strings.HasPrefix(id, "glm-") || strings.HasPrefix(id, "kimi-") {
+		modelType := "claude"
+		switch {
+		case strings.HasPrefix(id, "deepseek-"):
+			modelType = "deepseek"
+		case strings.HasPrefix(id, "glm-"):
+			modelType = "glm"
+		case strings.HasPrefix(id, "kimi-"):
+			modelType = "kimi"
+		}
 		return modelDefinition{
-			modelType: "claude", methods: []string{"messages", "countTokens"},
+			modelType: modelType, methods: []string{"messages", "countTokens"},
 			parameters: []string{"max_tokens", "stop_sequences", "tools", "tool_choice"},
 		}
 	}

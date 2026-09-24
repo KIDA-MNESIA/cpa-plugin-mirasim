@@ -73,7 +73,7 @@ func (a *Applier) Identifier() string { return "mirasim" }
 func (a *Applier) ApplyThinking(_ context.Context, req pluginapi.ThinkingApplyRequest) (pluginapi.PayloadResponse, error) {
 	model := ParseModel(req.Model.ID).ModelName
 	wire := wireCodex
-	if strings.HasPrefix(strings.ToLower(model), "claude-") {
+	if strings.HasPrefix(strings.ToLower(model), "claude-") || strings.HasPrefix(strings.ToLower(model), "deepseek-") || strings.HasPrefix(strings.ToLower(model), "glm-") || strings.HasPrefix(strings.ToLower(model), "kimi-") {
 		wire = wireClaude
 	}
 	body, errApply := ApplyForWire(req.Body, model, wire, req.Config)
@@ -103,7 +103,7 @@ func ParseModel(model string) ParsedModel {
 	case "auto", "-1":
 		parsed.Config = pluginapi.ThinkingConfig{Mode: "auto", Budget: -1}
 		parsed.HasConfig = true
-	case "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+	case "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
 		parsed.Config = pluginapi.ThinkingConfig{Mode: "level", Level: raw}
 		parsed.HasConfig = true
 	default:
@@ -244,6 +244,13 @@ func applyClaude(body []byte, model string, config pluginapi.ThinkingConfig, sha
 	adaptive := adaptiveClaude(shape)
 	switch config.Mode {
 	case "none":
+		if strings.HasPrefix(model, "deepseek-") {
+			body = deletePath(body, "thinking")
+			return setString(body, "output_config.effort", "off"), nil
+		}
+		if strings.HasPrefix(model, "glm-") || strings.HasPrefix(model, "kimi-") {
+			return body, &ConfigError{Code: "mirasim_effort_invalid", Message: fmt.Sprintf("%s does not offer an off effort", model)}
+		}
 		body = setString(body, "thinking.type", "disabled")
 		body = deletePath(body, "thinking.budget_tokens")
 		return deleteClaudeEffort(body), nil
@@ -256,10 +263,14 @@ func applyClaude(body []byte, model string, config pluginapi.ThinkingConfig, sha
 		return applyManualClaude(body, 1024)
 	case "level":
 		if adaptive {
-			if !isRelayEffort(config.Level) {
+			if config.Level == "off" && strings.HasPrefix(model, "deepseek-") {
+				body = deletePath(body, "thinking")
+				return setString(body, "output_config.effort", "off"), nil
+			}
+			if !modelAcceptsEffort(model, config.Level) {
 				return body, &ConfigError{
 					Code:    "mirasim_claude_effort_invalid",
-					Message: fmt.Sprintf("unsupported Claude thinking effort %q for %s; %s", config.Level, model, effortLadder),
+					Message: fmt.Sprintf("unsupported thinking effort %q for %s", config.Level, model),
 				}
 			}
 			body = setString(body, "thinking.type", "adaptive")
@@ -281,6 +292,17 @@ func applyClaude(body []byte, model string, config pluginapi.ThinkingConfig, sha
 		return applyManualClaude(body, config.Budget)
 	default:
 		return body, nil
+	}
+}
+
+func modelAcceptsEffort(model, level string) bool {
+	switch {
+	case strings.HasPrefix(model, "deepseek-"):
+		return level == "low" || level == "high" || level == "max"
+	case strings.HasPrefix(model, "glm-"), strings.HasPrefix(model, "kimi-"):
+		return level == "low" || level == "high" || level == "max"
+	default:
+		return isRelayEffort(level)
 	}
 }
 

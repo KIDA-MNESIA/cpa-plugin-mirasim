@@ -462,7 +462,7 @@ func (c *Client) authHeaders(ctx context.Context, client pluginapi.HostHTTPClien
 	}
 	var metadata map[string]string
 	if !controlPlane {
-		relayMetadata, errMetadata := c.relayMetadataLocked(ctx, requestPath)
+		relayMetadata, errMetadata := c.relayMetadataLocked(ctx, requestPath, body)
 		if errMetadata != nil {
 			return nil, errMetadata
 		}

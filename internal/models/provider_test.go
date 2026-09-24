@@ -22,7 +22,7 @@ func TestStaticModelsPublishNothingForAnOAuthOnlyExecutor(t *testing.T) {
 	}
 }
 
-func TestFallbackCatalogCoversClaudeAndGPT(t *testing.T) {
+func TestFallbackCatalogCoversOfficialBuiltinFamilies(t *testing.T) {
 	models := withLongContextAliases(fallbackModels())
 	if len(models) != len(fallbackModelIDs)+6 {
 		t.Fatalf("models = %#v", models)
@@ -30,7 +30,7 @@ func TestFallbackCatalogCoversClaudeAndGPT(t *testing.T) {
 	claudeCount := 0
 	gptCount := 0
 	for _, model := range models {
-		if !isExposedModel(model.ID) || len(model.SupportedGenerationMethods) == 0 || model.ContextLength == 0 || model.MaxCompletionTokens == 0 {
+		if !isExposedModel(model.ID) || len(model.SupportedGenerationMethods) == 0 || model.ContextLength == 0 {
 			t.Fatalf("incomplete model metadata: %#v", model)
 		}
 		switch model.Type {
@@ -43,6 +43,10 @@ func TestFallbackCatalogCoversClaudeAndGPT(t *testing.T) {
 			gptCount++
 			if model.SupportedGenerationMethods[0] != "responses" {
 				t.Fatalf("GPT model advertises wrong route: %#v", model)
+			}
+		case "deepseek", "glm", "kimi":
+			if model.SupportedGenerationMethods[0] != "messages" {
+				t.Fatalf("model advertises wrong route: %#v", model)
 			}
 		default:
 			t.Fatalf("unexpected model family: %#v", model)
@@ -77,9 +81,18 @@ func TestFallbackCatalogCoversClaudeAndGPT(t *testing.T) {
 	if opus.Created != 1770318000 || opus.ContextLength != 1000000 || opus.MaxCompletionTokens != 128000 || opus.Thinking == nil || opus.Thinking.Min != 0 || opus.Thinking.Max != 0 || !opus.Thinking.DynamicAllowed {
 		t.Fatalf("Claude Opus 4.6 metadata = %#v", opus)
 	}
+	if deepseek := byID["deepseek-flash"]; deepseek.Type != "deepseek" || deepseek.ContextLength != 1000000 || deepseek.MaxCompletionTokens != 384000 || deepseek.Thinking == nil || deepseek.Thinking.Levels[0] != "off" {
+		t.Fatalf("DeepSeek metadata = %#v", deepseek)
+	}
+	if glm := byID["glm-5.3-flash"]; glm.Type != "glm" || glm.ContextLength != 1000000 || glm.MaxCompletionTokens != 0 {
+		t.Fatalf("GLM metadata = %#v", glm)
+	}
+	if kimi := byID["kimi-k3"]; kimi.Type != "kimi" || kimi.ContextLength != 1048576 || kimi.MaxCompletionTokens != 0 {
+		t.Fatalf("Kimi metadata = %#v", kimi)
+	}
 }
 
-func TestExposedModelsIncludesClaudeAndGPTCatalogEntries(t *testing.T) {
+func TestExposedModelsIncludesOfficialBuiltinCatalogEntries(t *testing.T) {
 	models := exposedModels([]mirasim.RemoteModel{
 		{ID: "claude-sonnet-5", Object: "model", OwnedBy: "anthropic"},
 		{ID: "gpt-5.6-sol", Object: "model", OwnedBy: "openai"},
@@ -87,8 +100,8 @@ func TestExposedModelsIncludesClaudeAndGPTCatalogEntries(t *testing.T) {
 		{ID: "kimi-k3", Object: "model", OwnedBy: "other"},
 	})
 
-	if len(models) != 3 {
-		t.Fatalf("exposedModels() returned %d models, want 3: %#v", len(models), models)
+	if len(models) != 4 {
+		t.Fatalf("exposedModels() returned %d models, want 4: %#v", len(models), models)
 	}
 	for _, model := range models {
 		if !isExposedModel(model.ID) {

@@ -110,6 +110,23 @@ func TestRelayAgentRecognizesCodexRoutes(t *testing.T) {
 	}
 }
 
+func TestRelayAgentMatchesOfficialBuiltinModelFamilies(t *testing.T) {
+	for model, want := range map[string]string{
+		"claude-sonnet-5": "claude",
+		"deepseek-flash":  "dsh",
+		"glm-5.3-flash":   "zcode",
+		"kimi-k3":         "kimi",
+	} {
+		body := []byte(`{"model":"` + model + `"}`)
+		if got := relayAgentForRequest("/v1/messages", body); got != want {
+			t.Errorf("model %s: agent = %s, want %s", model, got, want)
+		}
+	}
+	if got := relayAgentForRequest("/v1/responses", []byte(`{"model":"deepseek-flash"}`)); got != "codex" {
+		t.Fatalf("Responses route agent = %s", got)
+	}
+}
+
 func TestRelaySealPublicKeyDefaultsAndFailsClosed(t *testing.T) {
 	t.Setenv("MIRASIM_SEAL_PUBKEY", "")
 	publicKey, errDefault := relaySealPublicKey()

@@ -77,6 +77,21 @@ func TestParseModelUsesCPASuffixConvention(t *testing.T) {
 	}
 }
 
+func TestDeepSeekOffKeepsItsOwnEffort(t *testing.T) {
+	parsed := ParseModel("deepseek-flash(off)")
+	if parsed.ModelName != "deepseek-flash" || parsed.Config.Mode != "level" || parsed.Config.Level != "off" {
+		t.Fatalf("parsed model = %#v", parsed)
+	}
+	body, err := ApplyForWire([]byte(`{"model":"deepseek-flash","thinking":{"type":"adaptive"}}`), parsed.ModelName, wireClaude, parsed.Config)
+	if err != nil || gjson.GetBytes(body, "output_config.effort").String() != "off" || gjson.GetBytes(body, "thinking").Exists() {
+		t.Fatalf("DeepSeek off body = %s, error = %v", body, err)
+	}
+	_, err = ApplyForWire([]byte(`{}`), "claude-sonnet-5", wireClaude, parsed.Config)
+	if err == nil {
+		t.Fatal("Claude unexpectedly accepted the DeepSeek-only off effort")
+	}
+}
+
 func TestApplyForWireUsesAdaptiveClaudeControls(t *testing.T) {
 	body := []byte(`{"model":"claude-sonnet-5","max_tokens":4096,"messages":[],"output_config":{"effort":"low","format":{"type":"json_schema"}}}`)
 	auto, errAuto := ApplyForWire(body, "claude-sonnet-5", wireClaude, pluginapi.ThinkingConfig{Mode: "auto", Budget: -1})
