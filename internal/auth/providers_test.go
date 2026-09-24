@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -47,16 +46,15 @@ func TestDiscoveredProvidersControlWhichLoginsMayStart(t *testing.T) {
 		t.Fatalf("authorize path = %q", path)
 	}
 
-	// github is only the configured default; discovery, not the default, decides.
-	_, errDefault := start("")
-	if errDefault == nil {
-		t.Fatal("undiscovered default provider accepted")
+	// github is only the configured default and discovery does not offer it, so
+	// the chooser keeps the login and marks nothing; the operator picks instead.
+	chooser, errDefault := start("")
+	if errDefault != nil {
+		t.Fatalf("undiscovered configured default broke the login: %v", errDefault)
 	}
-	if !strings.Contains(errDefault.Error(), "gitlab, google") {
-		t.Fatalf("error = %v, want the offered set", errDefault)
-	}
-	if strings.Contains(errDefault.Error(), "bad") || strings.Contains(errDefault.Error(), "<script>") {
-		t.Fatalf("malformed discovery entry survived: %v", errDefault)
+	links := startPageLinks(t, p, chooser)
+	if len(links) != 2 || links["gitlab"].isDefault || links["google"].isDefault {
+		t.Fatalf("offered buttons = %#v, want gitlab and google with no default", links)
 	}
 
 	body = `{"providers":["google"]}`

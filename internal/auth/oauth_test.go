@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -31,7 +32,7 @@ func TestRegisterManagementMountsOnlyTheLoginResources(t *testing.T) {
 	if len(registered.Routes) != 0 {
 		t.Fatalf("management routes = %#v, want none", registered.Routes)
 	}
-	if len(registered.Resources) != 2 || registered.Resources[0].Path != OAuthStartResource || registered.Resources[1].Path != OAuthCallbackResource {
+	if len(registered.Resources) != 3 || registered.Resources[0].Path != OAuthStartResource || registered.Resources[1].Path != OAuthAuthorizeResource || registered.Resources[2].Path != OAuthCallbackResource {
 		t.Fatalf("resources = %#v", registered.Resources)
 	}
 	for _, resource := range registered.Resources {
@@ -443,6 +444,154 @@ func TestStartLoginRejectsAMalformedRequestedProvider(t *testing.T) {
 	}
 }
 
+func TestStartPageListsTheOfferedProvidersAndMarksTheDefault(t *testing.T) {
+	settings := pluginconfig.Defaults()
+	settings.OAuthLoginProvider = "google"
+	provider, _ := newLoginProvider(t, settings)
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	links := startPageLinks(t, provider, started)
+	if len(links) != 2 {
+		t.Fatalf("provider buttons = %#v, want github and google", links)
+	}
+	if !links["google"].isDefault || links["github"].isDefault {
+		t.Fatalf("default buttons = %#v, want only google marked", links)
+	}
+	for id, link := range links {
+		parsed := mustParseURL(t, link.href)
+		if parsed.IsAbs() || parsed.Path != "authorize" || parsed.Query().Get("state") != started.State || parsed.Query().Get("provider") != id {
+			t.Fatalf("button %q link = %q, want a relative authorize link for this login", id, link.href)
+		}
+	}
+	body := string(serveStartPage(t, provider, started.State).Body)
+	for _, want := range []string{"Continue with GitHub", "Continue with Google", " (default)"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("start page lacks %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestStartPageRendersAnUnknownProviderByItsID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"providers":["gitlab"]}`))
+	}))
+	defer server.Close()
+	settings := pluginconfig.Defaults()
+	settings.AdminURL = server.URL
+	provider := New(settings, mirasim.NewPool())
+	if _, errRegister := provider.RegisterManagement(context.Background(), pluginapi.ManagementRegistrationRequest{ResourceBasePath: testResourceBasePath}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	links := startPageLinks(t, provider, started)
+	if len(links) != 1 || links["gitlab"].isDefault {
+		t.Fatalf("provider buttons = %#v, want only an unmarked gitlab", links)
+	}
+	if body := string(serveStartPage(t, provider, started.State).Body); !strings.Contains(body, "Continue with gitlab") {
+		t.Fatalf("unknown provider ID is not its own label:\n%s", body)
+	}
+}
+
+// A configured default Mirasim does not offer is a hint the operator outgrew,
+// not a reason to fail the login: the chooser just marks nothing.
+func TestStartLoginIgnoresAConfiguredDefaultMirasimDoesNotOffer(t *testing.T) {
+	settings := pluginconfig.Defaults()
+	settings.OAuthLoginProvider = "gitlab"
+	provider, _ := newLoginProvider(t, settings)
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatalf("unoffered configured default broke the login: %v", errStart)
+	}
+	links := startPageLinks(t, provider, started)
+	if len(links) != 2 || links["github"].isDefault || links["google"].isDefault {
+		t.Fatalf("offered buttons = %#v, want github and google with no default", links)
+	}
+	if target := authorizeURLFor(t, provider, started, "github"); mustParseURL(t, target).Path != "/auth/oauth/github/login" {
+		t.Fatalf("authorize URL = %q", target)
+	}
+}
+
+func TestAuthorizeRedirectsToTheChosenProvider(t *testing.T) {
+	provider, adminURL := newLoginProvider(t, pluginconfig.Defaults())
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	target := authorizeURLFor(t, provider, started, "google")
+	authorize := mustParseURL(t, target)
+	if authorize.Host != mustParseURL(t, adminURL).Host || authorize.Path != "/auth/oauth/google/login" {
+		t.Fatalf("google authorize URL = %s", authorize)
+	}
+	if authorize.Query().Get("state") != started.State {
+		t.Fatalf("authorize state = %q, want %q", authorize.Query().Get("state"), started.State)
+	}
+	if callback := mustParseURL(t, callbackURLOf(t, target)); callback.Path != testResourceBasePath+OAuthCallbackResource {
+		t.Fatalf("redirect_uri = %s", callback)
+	}
+	provider.oauth.mu.Lock()
+	chosen := provider.oauth.sessions[started.State].provider
+	provider.oauth.mu.Unlock()
+	if chosen != "google" {
+		t.Fatalf("recorded provider = %q, want google", chosen)
+	}
+}
+
+func TestAuthorizeRefusesABadState(t *testing.T) {
+	provider, _ := newLoginProvider(t, pluginconfig.Defaults())
+	for name, query := range map[string]url.Values{
+		"missing state": {"provider": []string{"github"}},
+		"unknown state": {"state": []string{"not-a-session"}, "provider": []string{"github"}},
+	} {
+		resp := serveAuthorize(t, provider, OAuthAuthorizeResource, query)
+		if resp.StatusCode != http.StatusBadRequest || resp.Headers.Get("Location") != "" {
+			t.Fatalf("%s authorize = %d, location = %q", name, resp.StatusCode, resp.Headers.Get("Location"))
+		}
+	}
+}
+
+func TestAuthorizeRefusesAnUnofferedProviderAndKeepsTheLoginPending(t *testing.T) {
+	provider, _ := newLoginProvider(t, pluginconfig.Defaults())
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	for name, providerID := range map[string]string{"missing": "", "unoffered": "gitlab", "malformed": "../etc"} {
+		resp := serveAuthorize(t, provider, OAuthAuthorizeResource, url.Values{"state": []string{started.State}, "provider": []string{providerID}})
+		if resp.StatusCode != http.StatusBadRequest || resp.Headers.Get("Location") != "" || !strings.Contains(string(resp.Body), "not available") {
+			t.Fatalf("%s authorize = %d %q %s", name, resp.StatusCode, resp.Headers.Get("Location"), resp.Body)
+		}
+	}
+	if target := authorizeURLFor(t, provider, started, "github"); target == "" {
+		t.Fatal("a refused choice spent the login")
+	}
+	if polled, _ := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: started.State}); polled.Status != pluginapi.AuthLoginStatusPending {
+		t.Fatalf("refused choices ended the login: %#v", polled)
+	}
+}
+
+func TestAuthorizeOnASpentLoginRedirectsNowhere(t *testing.T) {
+	provider, _ := newLoginProvider(t, pluginconfig.Defaults())
+	started, errStart := provider.StartLogin(context.Background(), startRequest())
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	if status, _ := deliverCallback(t, provider, callbackAddressOf(t, provider, started), url.Values{
+		"access_token":  []string{identityJWT("account-1", "", time.Now().Add(time.Hour))},
+		"refresh_token": []string{"refresh-secret"},
+	}); status != http.StatusOK {
+		t.Fatalf("callback status = %d", status)
+	}
+	resp := serveAuthorize(t, provider, OAuthAuthorizeResource, url.Values{"state": []string{started.State}, "provider": []string{"github"}})
+	if resp.StatusCode != http.StatusConflict || resp.Headers.Get("Location") != "" {
+		t.Fatalf("spent authorize = %d, location = %q", resp.StatusCode, resp.Headers.Get("Location"))
+	}
+}
+
 // Nothing tells the plugin when Management Center abandons a login, so a full
 // table makes room by dropping the oldest login instead of refusing the next.
 func TestANewLoginDisplacesTheOldestPendingOne(t *testing.T) {
@@ -637,25 +786,108 @@ func serveStartPage(t *testing.T, provider *Provider, state string) pluginapi.Ma
 	return resp
 }
 
-var startPageAuthorizeLink = regexp.MustCompile(`<a class="button" href="([^"]+)"`)
+var startPageProviderButton = regexp.MustCompile(`<a class="button([^"]*)" data-provider="([^"]+)" href="([^"]+)"`)
 
-// authorizeURLOf follows a started login to the Mirasim authorize URL its start
-// page links to.
+// providerLink is one provider button of the start page.
+type providerLink struct {
+	href      string
+	isDefault bool
+}
+
+// providerLinks reads the start page's provider buttons, keyed by provider ID.
+func providerLinks(t *testing.T, body []byte) map[string]providerLink {
+	t.Helper()
+	links := make(map[string]providerLink)
+	for _, match := range startPageProviderButton.FindAllSubmatch(body, -1) {
+		id := string(match[2])
+		if _, duplicate := links[id]; duplicate {
+			t.Fatalf("start page lists provider %q twice", id)
+		}
+		links[id] = providerLink{
+			href:      html.UnescapeString(string(match[3])),
+			isDefault: strings.Contains(string(match[1]), "default"),
+		}
+	}
+	return links
+}
+
+// startPageLinks serves the start page of a started login and returns its
+// provider buttons.
+func startPageLinks(t *testing.T, provider *Provider, started pluginapi.AuthLoginStartResponse) map[string]providerLink {
+	t.Helper()
+	page := serveStartPage(t, provider, started.State)
+	if page.StatusCode != http.StatusOK {
+		t.Fatalf("start page status = %d, body = %s", page.StatusCode, page.Body)
+	}
+	return providerLinks(t, page.Body)
+}
+
+// followAuthorizeLink walks a relative provider link through the authorize
+// route the way a browser does, and returns the Mirasim URL it redirects to.
+func followAuthorizeLink(t *testing.T, provider *Provider, href string) string {
+	t.Helper()
+	link := mustParseURL(t, href)
+	if link.IsAbs() {
+		t.Fatalf("provider link %q is not relative", href)
+	}
+	// The page lives at <base>/oauth/start, so its relative href resolves to
+	// <base>/oauth/<path>.
+	if resolved := path.Join(path.Dir(OAuthStartResource), link.Path); resolved != OAuthAuthorizeResource {
+		t.Fatalf("provider link %q resolves to %s, want %s", href, resolved, OAuthAuthorizeResource)
+	}
+	resp := serveAuthorize(t, provider, OAuthAuthorizeResource, link.Query())
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("authorize status = %d, want a redirect; body = %s", resp.StatusCode, resp.Body)
+	}
+	return resp.Headers.Get("Location")
+}
+
+// authorizeURLOf follows the marked default provider button of a started login
+// to the Mirasim authorize URL it redirects to.
 func authorizeURLOf(t *testing.T, provider *Provider, started pluginapi.AuthLoginStartResponse) string {
 	t.Helper()
 	startURL := mustParseURL(t, started.URL)
 	if startURL.IsAbs() || startURL.Path != testResourceBasePath+OAuthStartResource {
 		t.Fatalf("start URL = %q, want the relative start page", started.URL)
 	}
-	page := serveStartPage(t, provider, startURL.Query().Get("state"))
-	if page.StatusCode != http.StatusOK {
-		t.Fatalf("start page status = %d, body = %s", page.StatusCode, page.Body)
+	links := startPageLinks(t, provider, started)
+	chosen := ""
+	for id, link := range links {
+		if !link.isDefault {
+			continue
+		}
+		if chosen != "" {
+			t.Fatalf("start page marks both %q and %q as default", chosen, id)
+		}
+		chosen = id
 	}
-	match := startPageAuthorizeLink.FindSubmatch(page.Body)
-	if match == nil {
-		t.Fatalf("start page carries no authorize link:\n%s", page.Body)
+	if chosen == "" {
+		t.Fatal("start page marks no default provider")
 	}
-	return html.UnescapeString(string(match[1]))
+	return followAuthorizeLink(t, provider, links[chosen].href)
+}
+
+// authorizeURLFor follows the provider button for one ID.
+func authorizeURLFor(t *testing.T, provider *Provider, started pluginapi.AuthLoginStartResponse, id string) string {
+	t.Helper()
+	link, ok := startPageLinks(t, provider, started)[id]
+	if !ok {
+		t.Fatalf("start page has no button for provider %q", id)
+	}
+	return followAuthorizeLink(t, provider, link.href)
+}
+
+func serveAuthorize(t *testing.T, provider *Provider, path string, query url.Values) pluginapi.ManagementResponse {
+	t.Helper()
+	resp, errHandle := provider.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   testResourceBasePath + "/" + strings.TrimLeft(path, "/"),
+		Query:  query,
+	})
+	if errHandle != nil {
+		t.Fatalf("HandleManagement(authorize) error = %v", errHandle)
+	}
+	return resp
 }
 
 // callbackAddressOf is the redirect_uri a started login hands Mirasim.

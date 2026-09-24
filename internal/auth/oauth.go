@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -33,8 +34,13 @@ const (
 	maxOAuthSessions = 8
 	// OAuthStartResource is the resource route, under the plugin's resource
 	// prefix on CPA's own port, that Management Center's "open link" button
-	// opens: it links to Mirasim and takes the callback URL pasted back.
+	// opens: it lists the sign-in providers and takes the callback URL pasted
+	// back.
 	OAuthStartResource = "/oauth/start"
+	// OAuthAuthorizeResource is the resource route, under the same prefix, that
+	// the provider chosen on the start page links to. It redirects the browser
+	// to Mirasim for that provider.
+	OAuthAuthorizeResource = "/oauth/authorize"
 	// OAuthCallbackResource is the resource route, under the same prefix, that
 	// receives the Mirasim browser callback.
 	OAuthCallbackResource = "/oauth/callback"
@@ -43,10 +49,19 @@ const (
 	fallbackLoginProvider = "github"
 )
 
+// errNoLoginProviders reports discovery that enabled no way to sign in.
+var errNoLoginProviders = errors.New("Mirasim is not offering any sign-in provider right now")
+
 type oauthSession struct {
-	state        string
+	state string
+	// providers is the discovery answer the start page lists, and the only
+	// authority on which provider the authorize route may accept.
+	providers []loginProvider
+	// defaultProvider is the button the start page marks, empty when none of
+	// the offered providers matches the configured or requested one.
+	defaultProvider string
+	// provider is the offered provider the browser chose, empty until then.
 	provider     string
-	authURL      string
 	callbackURL  string
 	expiresAt    time.Time
 	accessToken  string
@@ -87,6 +102,7 @@ func (p *Provider) RegisterManagement(_ context.Context, req pluginapi.Managemen
 	p.oauth.mu.Unlock()
 	return pluginapi.ManagementRegistrationResponse{Resources: []pluginapi.ResourceRoute{
 		{Path: OAuthStartResource, Description: "Starts a Mirasim browser OAuth login.", Handler: p},
+		{Path: OAuthAuthorizeResource, Description: "Redirects to the chosen Mirasim sign-in provider.", Handler: p},
 		{Path: OAuthCallbackResource, Description: "Receives a Mirasim browser OAuth callback.", Handler: p},
 	}}, nil
 }
@@ -105,6 +121,8 @@ func (p *Provider) HandleManagement(_ context.Context, req pluginapi.ManagementR
 	switch req.Path {
 	case basePath + OAuthStartResource:
 		return p.oauth.startPage(req.Query.Get("state")), nil
+	case basePath + OAuthAuthorizeResource:
+		return p.handleOAuthAuthorize(req), nil
 	case basePath + OAuthCallbackResource:
 		if pasted, okPasted := req.Query[pastedCallbackField]; okPasted {
 			result, okResult := pastedCallbackResult(strings.Join(pasted, ""))
@@ -128,6 +146,10 @@ func (p *Provider) HandleManagement(_ context.Context, req pluginapi.ManagementR
 // the start page, and it is relative on purpose: Management Center opens it
 // against its own address, which is the one address the browser is known to
 // reach CPA on, while the host only ever reports 127.0.0.1.
+//
+// The page lists every provider Mirasim currently offers and sends the browser
+// to the one the operator picks, so the session is not committed to a provider
+// up front.
 func (p *Provider) StartLogin(ctx context.Context, req pluginapi.AuthLoginStartRequest) (pluginapi.AuthLoginStartResponse, error) {
 	if provider := strings.TrimSpace(req.Provider); provider != "" && !strings.EqualFold(provider, credentials.Provider) {
 		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("unsupported OAuth provider %q", provider)
@@ -147,16 +169,16 @@ func (p *Provider) StartLogin(ctx context.Context, req pluginapi.AuthLoginStartR
 	if resourceBasePath == "" {
 		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("Mirasim OAuth callback route is not registered with CPA")
 	}
-	loginProvider, errProvider := resolveLoginProvider(metadataString(req.Metadata, "provider"), p.settings.OAuthLoginProvider)
-	if errProvider != nil {
-		return pluginapi.AuthLoginStartResponse{}, errProvider
-	}
 	offered, errDiscovery := discoverLoginProviders(ctx, p.settings.AdminURL, req.Host.ProxyURL)
 	if errDiscovery != nil {
 		return pluginapi.AuthLoginStartResponse{}, errDiscovery
 	}
-	if !providerOffered(offered, loginProvider) {
-		return pluginapi.AuthLoginStartResponse{}, unsupportedLoginProviderError(loginProvider, offered)
+	if len(offered) == 0 {
+		return pluginapi.AuthLoginStartResponse{}, errNoLoginProviders
+	}
+	defaultProvider, errDefault := selectLoginDefault(offered, metadataString(req.Metadata, "provider"), p.settings.OAuthLoginProvider)
+	if errDefault != nil {
+		return pluginapi.AuthLoginStartResponse{}, errDefault
 	}
 	state, errState := randomOAuthValue(32)
 	if errState != nil {
@@ -168,10 +190,6 @@ func (p *Provider) StartLogin(ctx context.Context, req pluginapi.AuthLoginStartR
 	callbackURL := *origin
 	callbackURL.Path = resourceBasePath + OAuthCallbackResource
 	callbackURL.RawQuery = url.Values{"state": []string{state}}.Encode()
-	authURL, errURL := buildMirasimOAuthURL(p.settings.AdminURL, loginProvider, callbackURL.String(), state)
-	if errURL != nil {
-		return pluginapi.AuthLoginStartResponse{}, errURL
-	}
 
 	startURL := url.URL{Path: resourceBasePath + OAuthStartResource, RawQuery: url.Values{"state": []string{state}}.Encode()}
 
@@ -180,20 +198,68 @@ func (p *Provider) StartLogin(ctx context.Context, req pluginapi.AuthLoginStartR
 	p.oauth.mu.Lock()
 	p.oauth.purgeLocked(now)
 	p.oauth.makeRoomLocked()
-	p.oauth.sessions[state] = &oauthSession{state: state, provider: loginProvider, authURL: authURL, callbackURL: callbackURL.String(), expiresAt: expiresAt}
+	p.oauth.sessions[state] = &oauthSession{
+		state:           state,
+		providers:       offered,
+		defaultProvider: defaultProvider,
+		callbackURL:     callbackURL.String(),
+		expiresAt:       expiresAt,
+	}
 	p.oauth.mu.Unlock()
 
+	metadata := map[string]any{
+		"flow":       "browser_oauth",
+		"expires_at": expiresAt.UTC().Format(time.RFC3339),
+	}
+	if defaultProvider != "" {
+		metadata["login_provider"] = defaultProvider
+	}
 	return pluginapi.AuthLoginStartResponse{
 		Provider:  credentials.Provider,
 		URL:       startURL.String(),
 		State:     state,
 		ExpiresAt: expiresAt,
-		Metadata: map[string]any{
-			"flow":           "browser_oauth",
-			"login_provider": loginProvider,
-			"expires_at":     expiresAt.UTC().Format(time.RFC3339),
-		},
+		Metadata:  metadata,
 	}, nil
+}
+
+// handleOAuthAuthorize sends the browser to Mirasim for the provider chosen on
+// the start page. The pending session, not the query string, is the authority
+// on which providers are offered; a choice that cannot be honored is answered
+// with a page and leaves the login pending, so the operator can pick again.
+func (p *Provider) handleOAuthAuthorize(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	state := strings.TrimSpace(req.Query.Get("state"))
+	provider := strings.ToLower(strings.TrimSpace(req.Query.Get("provider")))
+	if state == "" || provider == "" {
+		return callbackPageResponse(http.StatusBadRequest, authorizeProviderPage)
+	}
+	p.oauth.mu.Lock()
+	p.oauth.purgeLocked(p.oauth.now())
+	session := p.oauth.sessions[state]
+	if session == nil || !constantTimeEqual(session.state, state) {
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusBadRequest, startExpiredPage)
+	}
+	if session.callbackDone || session.auth != nil {
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusConflict, callbackUsedPage)
+	}
+	if !providerOffered(session.providers, provider) {
+		p.oauth.mu.Unlock()
+		return callbackPageResponse(http.StatusBadRequest, authorizeProviderPage)
+	}
+	session.provider = provider
+	callbackURL := session.callbackURL
+	p.oauth.mu.Unlock()
+
+	authURL, errURL := buildMirasimOAuthURL(p.settings.AdminURL, provider, callbackURL, state)
+	if errURL != nil {
+		return callbackPageResponse(http.StatusInternalServerError, authorizeUnavailablePage)
+	}
+	return pluginapi.ManagementResponse{
+		StatusCode: http.StatusFound,
+		Headers:    browserHeaders(http.Header{"Location": []string{authURL}}),
+	}
 }
 
 func (p *Provider) PollLogin(ctx context.Context, req pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
@@ -324,6 +390,32 @@ func loginCallbackOrigin(baseURL string) (*url.URL, error) {
 	return &url.URL{Scheme: parsed.Scheme, Host: parsed.Host}, nil
 }
 
+// selectLoginDefault picks the provider the start page marks. An explicitly
+// requested provider has to be offered; a configured one is only a hint, so a
+// value Mirasim does not offer leaves the chooser without a marked default
+// instead of failing the login. With neither naming one, github is the fallback.
+func selectLoginDefault(offered []loginProvider, requested, configured string) (string, error) {
+	if value := strings.ToLower(strings.TrimSpace(requested)); value != "" {
+		if !providerSlug.MatchString(value) {
+			return "", fmt.Errorf("invalid Mirasim sign-in provider")
+		}
+		if !providerOffered(offered, value) {
+			return "", unsupportedLoginProviderError(value, offered)
+		}
+		return value, nil
+	}
+	if value := strings.ToLower(strings.TrimSpace(configured)); value != "" {
+		if providerSlug.MatchString(value) && providerOffered(offered, value) {
+			return value, nil
+		}
+		return "", nil
+	}
+	if providerOffered(offered, fallbackLoginProvider) {
+		return fallbackLoginProvider, nil
+	}
+	return "", nil
+}
+
 // resolveLoginProvider takes the first named candidate in precedence order and
 // falls back to github. An explicitly requested but malformed provider is an
 // error rather than something silently replaced by the default.
@@ -364,7 +456,7 @@ func unsupportedLoginProviderError(requested string, offered []loginProvider) er
 		ids = append(ids, provider.ID)
 	}
 	if len(ids) == 0 {
-		return fmt.Errorf("Mirasim is not offering any sign-in provider right now")
+		return errNoLoginProviders
 	}
 	sort.Strings(ids)
 	return fmt.Errorf("Mirasim sign-in provider %q is not offered; available: %s", requested, strings.Join(ids, ", "))
