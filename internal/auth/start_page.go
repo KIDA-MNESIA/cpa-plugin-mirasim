@@ -138,10 +138,13 @@ var startPageTemplate = template.Must(template.New("start").Parse(`<!doctype htm
 
 // emailCodePageResponse renders the code-entry form for one login. Only the
 // login's own state and its remaining code sends are placed in it, so neither
-// the address nor the code ever reaches the browser through the page.
-func emailCodePageResponse(state string, status int, retry bool, remaining int) pluginapi.ManagementResponse {
+// the address nor the code ever reaches the browser through the page. A
+// rate-limited resend renders the same form, with limited set when the
+// interval is what blocked it, so the operator still has somewhere to enter a
+// code that already arrived.
+func emailCodePageResponse(state string, status int, retry, limited bool, remaining int) pluginapi.ManagementResponse {
 	var body bytes.Buffer
-	data := emailCodePageData{State: state, Field: emailCodeField, Retry: retry, Remaining: remaining, Max: maxEmailCodeSends, Minutes: int(oauthLoginTTL.Minutes())}
+	data := emailCodePageData{State: state, Field: emailCodeField, Retry: retry, Limited: limited, Remaining: remaining, Max: maxEmailCodeSends, Minutes: int(oauthLoginTTL.Minutes())}
 	if errRender := emailCodePageTemplate.Execute(&body, data); errRender != nil {
 		return callbackPageResponse(http.StatusInternalServerError, callbackNotFoundPage)
 	}
@@ -160,6 +163,7 @@ type emailCodePageData struct {
 	State     string
 	Field     string
 	Retry     bool
+	Limited   bool
 	Remaining int
 	Max       int
 	Minutes   int
@@ -177,10 +181,11 @@ var emailCodePageTemplate = template.Must(template.New("email-code").Parse(`<!do
 	`<p>如果该邮箱已有 Mirasim 账号，验证码已发送。请在下方输入。</p>` +
 	`<p class="en">If that address has a Mirasim account, a sign-in code was mailed to it. Enter it below.</p>` +
 	`{{if .Retry}}<p class="notice">验证码未通过，请重试。</p><p class="en notice">That code was not accepted. Try again.</p>{{end}}` +
+	`{{if .Limited}}<p class="notice">请求验证码过于频繁：两次发送需间隔一分钟。已收到的验证码仍可在下方输入。</p><p class="en notice">Too many code requests: sends are one minute apart. A code you already received can still be entered below.</p>{{end}}` +
 	`<form method="get" action="verify"><input type="hidden" name="state" value="{{.State}}"><input type="text" name="{{.Field}}" required autocomplete="one-time-code" inputmode="numeric" spellcheck="false" placeholder="123456">` +
 	`<button type="submit">完成登录 / Verify code</button></form>` +
 	`{{if .Remaining}}<form method="get" action="send"><input type="hidden" name="state" value="{{.State}}"><button type="submit">重新发送验证码 / Resend code</button></form>` +
-	`<p>本次登录还可发送 {{.Remaining}} 次验证码（最多 {{.Max}} 次）。</p><p class="en">{{.Remaining}} of {{.Max}} code sends remain for this sign-in.</p>{{else}}` +
+	`<p>本次登录还可发送 {{.Remaining}} 次验证码（最多 {{.Max}} 次），两次发送间隔一分钟。</p><p class="en">{{.Remaining}} of {{.Max}} code sends remain for this sign-in; sends are one minute apart.</p>{{else}}` +
 	`<p class="notice">本次登录的验证码发送次数已用完；如仍未收到验证码，请重新开始登录。</p><p class="en notice">No code sends remain for this sign-in; if the mail does not arrive, start the sign-in again.</p>{{end}}` +
 	`<p>本次登录 {{.Minutes}} 分钟内有效。</p><p class="en">This sign-in expires {{.Minutes}} minutes after it was started.</p>` +
 	`</body></html>`))
@@ -208,10 +213,6 @@ const (
 	emailAddressPinnedPage = callbackPagePrefix + `<title>Address already bound</title></head><body>` +
 		`<h1>This sign-in is bound to another address</h1><p>The first address a code was mailed to owns this sign-in. Start the Mirasim login again from Management Center to use a different address.</p>` +
 		`<p>本次登录已绑定到最先收到验证码的邮箱，不能再改用其他地址。如需更换，请回到管理面板重新开始 Mirasim 登录。</p></body></html>`
-
-	emailCodeLimitedPage = callbackPagePrefix + `<title>Too many code requests</title></head><body>` +
-		`<h1>Too many code requests</h1><p>Wait a minute before requesting another code. The sign-in is still waiting.</p>` +
-		`<p>验证码请求过于频繁，请稍后再试。本次登录仍然有效。</p></body></html>`
 
 	emailSendFailedPage = callbackPagePrefix + `<title>Code not sent</title></head><body>` +
 		`<h1>Mirasim did not send the code</h1><p>The sign-in is still waiting. Wait a minute and request another code from the Mirasim sign-in page.</p>` +

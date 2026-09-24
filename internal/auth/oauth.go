@@ -367,8 +367,13 @@ func (p *Provider) handleOAuthEmailSend(ctx context.Context, req pluginapi.Manag
 	}
 	now := p.oauth.now()
 	if session.emailSends >= maxEmailCodeSends || (!session.emailSentAt.IsZero() && now.Sub(session.emailSentAt) < emailCodeSendInterval) {
+		remaining := maxEmailCodeSends - session.emailSends
+		limited := remaining > 0
 		p.oauth.mu.Unlock()
-		return callbackPageResponse(http.StatusTooManyRequests, emailCodeLimitedPage)
+		// The code-entry form again, with the wait notice when the interval is
+		// what blocked the resend: an impatient click must not cost the operator
+		// the code that was already mailed.
+		return emailCodePageResponse(state, http.StatusTooManyRequests, false, limited, remaining)
 	}
 	// Pin and spend under one lock hold, before the outbound call: the pin has
 	// to be visible to a competing send for the whole time this one is in
@@ -407,7 +412,7 @@ func (p *Provider) handleOAuthEmailSend(ctx context.Context, req pluginapi.Manag
 		remaining = maxEmailCodeSends - current.emailSends
 	}
 	p.oauth.mu.Unlock()
-	return emailCodePageResponse(state, http.StatusOK, false, remaining)
+	return emailCodePageResponse(state, http.StatusOK, false, false, remaining)
 }
 
 // handleOAuthEmailVerify exchanges the code entered on the code page for
@@ -445,7 +450,7 @@ func (p *Provider) handleOAuthEmailVerify(ctx context.Context, req pluginapi.Man
 	if errCode != nil {
 		remaining := maxEmailCodeSends - session.emailSends
 		p.oauth.mu.Unlock()
-		return emailCodePageResponse(state, http.StatusBadRequest, true, remaining)
+		return emailCodePageResponse(state, http.StatusBadRequest, true, false, remaining)
 	}
 	address, proxyURL := session.email, session.proxyURL
 	p.oauth.mu.Unlock()
@@ -477,7 +482,7 @@ func (p *Provider) handleOAuthEmailVerify(ctx context.Context, req pluginapi.Man
 			session.errorMessage = "Mirasim email sign-in failed: too many code attempts"
 			return callbackPageResponse(http.StatusBadRequest, emailAttemptsPage)
 		}
-		return emailCodePageResponse(state, http.StatusBadRequest, true, maxEmailCodeSends-session.emailSends)
+		return emailCodePageResponse(state, http.StatusBadRequest, true, false, maxEmailCodeSends-session.emailSends)
 	}
 	session.callbackDone = true
 	session.accessToken = accessToken

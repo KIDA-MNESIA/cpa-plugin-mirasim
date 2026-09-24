@@ -378,29 +378,36 @@ func TestEmailSendIsRateLimitedPerLogin(t *testing.T) {
 	if errStart != nil {
 		t.Fatal(errStart)
 	}
-	send := func() int {
-		status, _ := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
+	send := func() (int, string) {
+		return serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
 			"state":           []string{started.State},
 			emailAddressField: []string{"user@example.com"},
 		})
-		return status
 	}
-	if status := send(); status != http.StatusOK {
+	if status, _ := send(); status != http.StatusOK {
 		t.Fatalf("first send = %d", status)
 	}
-	if status := send(); status != http.StatusTooManyRequests {
+	status, body := send()
+	if status != http.StatusTooManyRequests {
 		t.Fatalf("immediate second send = %d, want the interval limit", status)
 	}
+	// The wait notice must not dead-end: the code form is still there for a
+	// code that already arrived, and the page names the interval.
+	for _, want := range []string{`action="verify"`, `name="` + emailCodeField + `"`, "one minute apart"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("rate-limit page lacks %q:\n%s", want, body)
+		}
+	}
 	now = now.Add(emailCodeSendInterval)
-	if status := send(); status != http.StatusOK {
+	if status, _ := send(); status != http.StatusOK {
 		t.Fatalf("send after the interval = %d", status)
 	}
 	now = now.Add(emailCodeSendInterval)
-	if status := send(); status != http.StatusOK {
+	if status, _ := send(); status != http.StatusOK {
 		t.Fatalf("third send = %d", status)
 	}
 	now = now.Add(emailCodeSendInterval)
-	if status := send(); status != http.StatusTooManyRequests {
+	if status, _ := send(); status != http.StatusTooManyRequests {
 		t.Fatalf("fourth send = %d, want the count limit", status)
 	}
 	if addresses := fake.sentAddresses(); len(addresses) != maxEmailCodeSends {
@@ -772,7 +779,7 @@ func TestEmailCodePageOffersAResendThatNeedsOnlyTheState(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("send status = %d, body = %s", status, body)
 	}
-	for _, want := range []string{`action="send"`, `name="state" value="` + started.State + `"`, "Resend code", "2 of 3 code sends remain"} {
+	for _, want := range []string{`action="send"`, `name="state" value="` + started.State + `"`, "Resend code", "2 of 3 code sends remain", "one minute apart"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("code page lacks %q:\n%s", want, body)
 		}
@@ -818,6 +825,12 @@ func TestExhaustedEmailLoginReadsAsFailed(t *testing.T) {
 	}
 	if strings.Contains(string(page.Body), "already used") {
 		t.Fatal("the exhausted login still reads as a used callback")
+	}
+	if resp := serveAuthorize(t, provider, OAuthAuthorizeResource, url.Values{
+		"state":    []string{started.State},
+		"provider": []string{"github"},
+	}); resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(resp.Body), "Too many code attempts") {
+		t.Fatalf("authorize on an exhausted login = %d, body = %s", resp.StatusCode, resp.Body)
 	}
 	if status, body := serveCallback(t, provider, testResourceBasePath+OAuthEmailSendResource, url.Values{
 		"state":           []string{started.State},
