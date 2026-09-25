@@ -4,7 +4,7 @@ A native [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin for 
 
 ## Requirements
 
-- CLIProxyAPI `v7.3.17` or later. This release builds against `v7.3.17` and uses its image executor format and request-path metadata; older hosts may reject the plugin or fail to route image requests.
+- CLIProxyAPI `v7.2.155` or later; `v7.2.159` or later recommended. This release registers plugin schema version 6, which a host only accepts from `v7.2.155`; `v7.2.154` and older refuse to load the plugin. `v7.2.159` adds the native quota provider that the standard Management Center draws the quota card from; on `v7.2.155`-`v7.2.158` quota still works through the embedded quota page and the compatibility route. The module still builds against the `v7.3.17` SDK, but the running host does not need to be that new.
 - For source builds: Go 1.26+ and a C compiler supporting `c-shared`.
 - A private, persistent, writable CPA `auth-dir`.
 
@@ -165,7 +165,7 @@ Account-wide windows and model-scoped ones such as `7d_fable` are grouped separa
 
 Quotas come only from `GET /v1/limits`. Unavailable limits report no buckets; quota checks never trigger inference. Utilization is rounded once to one decimal and then saturates at 99%, matching the official client.
 
-The plugin's own routes are the compatibility quota route, the five login resources, and the quota page. Earlier releases needed a patched Management Center to draw plugin quota; the embeddable page works with the standard panel, while the compatibility route keeps an already deployed patched card functional.
+The plugin's own routes are the compatibility quota route, the five login resources, and the quota page. Earlier releases needed a patched Management Center to draw plugin quota; the embeddable page works with the standard panel, while the compatibility route keeps an already deployed patched card functional. The standard panel's native quota card reaches the plugin through its quota provider, which needs CPA `v7.2.159` or later; on `v7.2.155`-`v7.2.158` the embeddable page and the compatibility route are the quota surfaces.
 
 Validate inference with an actual Claude Code or Codex client and correlate the result with CPA logs. A minimal hand-written Messages request can fail even when the real client works. Model catalog presence does not guarantee upstream capacity.
 
