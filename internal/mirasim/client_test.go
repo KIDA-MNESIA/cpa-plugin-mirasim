@@ -869,6 +869,22 @@ func TestPrepareHeadersDropsClientCredentials(t *testing.T) {
 	}
 }
 
+func TestPrepareHeadersDropsResponsesLiteMarker(t *testing.T) {
+	headers := prepareHeaders(http.Header{
+		"X-Openai-Internal-Codex-Responses-Lite": []string{"true"},
+		"x-openai-internal-codex-responses-lite": []string{"true"},
+		"X-Codex-Beta-Features":                  []string{"remote_compaction_v2"},
+	}, nil, true)
+	for name := range headers {
+		if strings.EqualFold(name, responsesLiteHeader) {
+			t.Fatalf("Responses Lite marker survived: %#v", headers)
+		}
+	}
+	if headers.Get("X-Codex-Beta-Features") != "remote_compaction_v2" {
+		t.Fatalf("unrelated header dropped: %#v", headers)
+	}
+}
+
 func TestPrepareHeadersDropsOnlyMirasimOAuthBetaValue(t *testing.T) {
 	headers := prepareHeaders(http.Header{
 		"Anthropic-Beta": []string{

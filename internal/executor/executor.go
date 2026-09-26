@@ -269,6 +269,9 @@ func buildProviderRequest(req pluginapi.ExecutorRequest, stream bool, shape thin
 	if errTranslate != nil {
 		return nil, providerRoute{}, errTranslate
 	}
+	if wire == sdktranslator.FormatCodex {
+		body = promoteAdditionalTools(body)
+	}
 	body, errNormalize := normalizeBody(body, model, stream, wire)
 	if errNormalize != nil {
 		return nil, providerRoute{}, errNormalize
@@ -520,6 +523,9 @@ func upstreamHeaders(source http.Header, wire sdktranslator.Format) http.Header 
 
 func normalizeHTTPRequestBody(body []byte, model string, wire sdktranslator.Format, shape thinkingpkg.ModelShape) ([]byte, error) {
 	body = thinkingpkg.NormalizeWorkflowRequest(body)
+	if wire == sdktranslator.FormatCodex {
+		body = promoteAdditionalTools(body)
+	}
 	var payload map[string]any
 	if errDecode := json.Unmarshal(body, &payload); errDecode != nil {
 		return nil, fmt.Errorf("decode Mirasim HTTP request: %w", errDecode)

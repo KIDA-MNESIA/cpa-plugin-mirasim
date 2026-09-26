@@ -35,6 +35,7 @@ const (
 	headerMirasimSession           = "x-mirasim-session"
 	headerMirasimAgent             = "x-mirasim-agent"
 	headerMirasimCall              = "x-mirasim-call"
+	responsesLiteHeader            = "x-openai-internal-codex-responses-lite"
 )
 
 var signatureHeaderNames = map[string]struct{}{

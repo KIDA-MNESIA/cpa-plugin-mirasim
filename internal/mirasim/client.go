@@ -730,8 +730,11 @@ func (c *Client) observeQuota(headers http.Header) {
 func prepareHeaders(source, auth http.Header, stream bool) http.Header {
 	headers := cloneHeader(source)
 	for name := range headers {
-		if strings.HasPrefix(strings.ToLower(name), "x-mirasim-") {
-			headers.Del(name)
+		// Codex marks a Responses Lite request with this header. The relay
+		// refuses the marker with 400 unsupported_value even once the executor
+		// has moved Lite's tools back to the top level, so it never leaves here.
+		if strings.HasPrefix(strings.ToLower(name), "x-mirasim-") || strings.EqualFold(name, responsesLiteHeader) {
+			delete(headers, name)
 		}
 	}
 	for _, name := range []string{

@@ -135,6 +135,10 @@ Claude and GPT use `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. DeepSee
 
 That refusal comes from the executor, which is the only path a Mirasim request takes. The plugin also registers a thinking applier, but CPA consults registered appliers only from its built-in executors, and it discards an error one returns. Nothing here depends on it being reached; it is declared so the shape stays available if that path ever widens.
 
+## Codex Responses Lite
+
+Codex switches to Responses Lite for any model whose catalog entry sets `use_responses_lite`, and CPA's Codex client catalog sets it for the GPT models Mirasim also serves. A Lite request sends an empty top-level `tools` array, declares its tools in an `additional_tools` item at the head of `input`, and carries an `x-openai-internal-codex-responses-lite: true` header. The ChatGPT backend accepts that shape; the relay answers the item and the header alike with HTTP 400 `unsupported_value`, "The request was rejected as invalid.", even on the first request of a fresh session. The plugin therefore moves every `additional_tools` item's tools to the end of the top-level `tools` array, where the relay accepts them, namespaces included, and never forwards the header. Every other input item keeps its position, so encrypted reasoning and compaction history still round-trip. This applies to executor requests, `/responses/compact`, and the raw Codex routes alike; the websocket mirror of the marker inside `client_metadata` is harmless and is left alone.
+
 ## Codex compaction
 
 CPA Responses compact requests use `/v1/responses/compact`, including the `/backend-api/codex/responses/compact` alias. This path accepts non-streaming Responses input/output and preserves opaque compaction items. Ordinary Responses completions retain their SSE handling.

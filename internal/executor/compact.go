@@ -21,7 +21,7 @@ func compactError(message string) error {
 // Compact returns an opaque compaction item in JSON, not the completion SSE
 // envelope. Keep the Responses shape intact so encrypted history can round-trip.
 func compactBody(raw []byte, model string) ([]byte, error) {
-	raw = thinkingpkg.NormalizeWorkflowRequest(raw)
+	raw = promoteAdditionalTools(thinkingpkg.NormalizeWorkflowRequest(raw))
 	parsed := thinkingpkg.ParseModel(model)
 	if !strings.HasPrefix(strings.ToLower(parsed.ModelName), "gpt-") {
 		return nil, compactError("Mirasim compact requires a GPT model")
