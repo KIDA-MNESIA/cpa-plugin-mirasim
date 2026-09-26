@@ -116,10 +116,11 @@ func (p *Page) Serve(ctx context.Context, req pluginapi.ManagementRequest, host 
 }
 
 type pageView struct {
-	Accounts []accountView
-	Problem  string
-	Empty    bool
-	ReadAt   string
+	Accounts    []accountView
+	Problem     string
+	Empty       bool
+	ReadAt      string
+	ScriptNonce string
 }
 
 type accountView struct {
@@ -140,6 +141,7 @@ type bucketView struct {
 	Window      string
 	Remaining   string
 	Reset       string
+	ResetAt     string
 	Description string
 }
 
@@ -191,10 +193,12 @@ func (p *Page) accountView(ctx context.Context, host HostServices, client plugin
 			rendered.DisplayName = groupFallbackName
 		}
 		for _, bucket := range group.Buckets {
+			reset, resetAt := formatReset(bucket.ResetTime)
 			rendered.Buckets = append(rendered.Buckets, bucketView{
 				Window:      valueOrDash(bucket.Window),
 				Remaining:   formatPercent(bucket.RemainingFraction),
-				Reset:       formatReset(bucket.ResetTime),
+				Reset:       reset,
+				ResetAt:     resetAt,
 				Description: valueOrDash(bucket.Description),
 			})
 		}
@@ -230,33 +234,36 @@ func formatPercent(fraction float64) string {
 	return fmt.Sprintf("%.1f%%", fraction*100)
 }
 
-// formatReset shows the reset time in UTC rather than the browser's zone: the
-// page is server-rendered with no script, and UTC is how the limits API
-// reports it.
-func formatReset(value string) string {
+// formatReset keeps UTC as a readable fallback and returns the instant for
+// the browser to display in its own time zone and use for the countdown.
+func formatReset(value string) (display, instant string) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return "—"
+		return "—", ""
 	}
-	parsed, errParse := time.Parse(time.RFC3339, value)
+	parsed, errParse := time.Parse(time.RFC3339Nano, value)
 	if errParse != nil {
-		return value
+		return value, ""
 	}
-	return parsed.UTC().Format("2006-01-02 15:04 UTC")
+	utc := parsed.UTC()
+	// JavaScript dates have millisecond precision; keep the datetime within
+	// the browser's standardized ISO 8601 parsing range.
+	return utc.Format("2006-01-02 15:04 UTC"), utc.Truncate(time.Millisecond).Format(time.RFC3339Nano)
 }
 
 func renderResponse(status int, view pageView) (pluginapi.ManagementResponse, error) {
 	if view.ReadAt == "" {
 		view.ReadAt = time.Now().UTC().Format("2006-01-02 15:04 MST")
 	}
+	view.ScriptNonce = rand.Text()
 	var body bytes.Buffer
 	if errRender := pageTemplate.Execute(&body, view); errRender != nil {
 		return pluginapi.ManagementResponse{}, fmt.Errorf("render Mirasim quota page: %w", errRender)
 	}
-	return pluginapi.ManagementResponse{StatusCode: status, Headers: pageHeaders(), Body: body.Bytes()}, nil
+	return pluginapi.ManagementResponse{StatusCode: status, Headers: pageHeaders(view.ScriptNonce), Body: body.Bytes()}, nil
 }
 
-func pageHeaders() http.Header {
+func pageHeaders(scriptNonce string) http.Header {
 	headers := make(http.Header)
 	headers.Set("Content-Type", "text/html; charset=utf-8")
 	headers.Set("Cache-Control", "no-store")
@@ -264,7 +271,7 @@ func pageHeaders() http.Header {
 	headers.Set("X-Content-Type-Options", "nosniff")
 	// frame-ancestors 'self' is what lets the panel embed this page in its
 	// iframe; the login pages keep 'none', because nothing embeds them.
-	headers.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'self'; form-action 'none'")
+	headers.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-"+scriptNonce+"'; base-uri 'none'; frame-ancestors 'self'; form-action 'none'")
 	return headers
 }
 
@@ -288,7 +295,7 @@ var pageTemplate = template.Must(template.New("mirasim-quota").Funcs(template.Fu
 	"unavailableAccount": func() string { return unavailableAccount },
 	"emptyAccount":       func() string { return emptyAccount },
 }).Parse(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{font:16px system-ui,sans-serif;max-width:44rem;margin:3rem auto;padding:0 1.25rem;color:#171717}h1{font-size:1.6rem;margin:0 0 .25rem}h1 span{color:#777;font-size:1rem;font-weight:400}h2{font-size:1.15rem;margin:2rem 0 .5rem}h3{font-size:1rem;margin:1rem 0 .35rem}p{color:#555;margin:.35rem 0}table{width:100%;border-collapse:collapse;margin:.25rem 0 1rem}th,td{text-align:left;padding:.4rem .5rem;border-bottom:1px solid #e5e5e5;vertical-align:top}th{font-weight:600;color:#333}.unavailable,.problem{color:#a33}.read-at{color:#777;font-size:.85rem}</style>
+<style>body{font:16px system-ui,sans-serif;max-width:66rem;margin:3rem auto;padding:0 1.25rem;color:#171717}h1{font-size:1.6rem;margin:0 0 .25rem}h1 span{color:#777;font-size:1rem;font-weight:400}h2{font-size:1.15rem;margin:2rem 0 .5rem}h3{font-size:1rem;margin:1rem 0 .35rem}p{color:#555;margin:.35rem 0}.table-scroll{overflow-x:auto}table{width:100%;min-width:44rem;border-collapse:collapse;margin:.25rem 0 1rem}th,td{text-align:left;padding:.4rem .5rem;border-bottom:1px solid #e5e5e5;vertical-align:top}th{font-weight:600;color:#333}.reset-countdown{white-space:nowrap}.unavailable,.problem{color:#a33}.read-at{color:#777;font-size:.85rem}</style>
 <title>Mirasim 配额 / Mirasim quota</title></head><body>
 <h1>Mirasim 配额 <span>Mirasim quota</span></h1>
 <p class="read-at">读取时间 / Read at {{.ReadAt}}</p>
@@ -301,9 +308,46 @@ var pageTemplate = template.Must(template.New("mirasim-quota").Funcs(template.Fu
 {{if .Unavailable}}<p class="unavailable">{{unavailableAccount}}</p>{{end}}
 {{if .Empty}}<p>{{emptyAccount}}</p>{{end}}
 {{range .Groups}}<h3>{{.DisplayName}}</h3>
-<table><thead><tr><th>窗口 / Window</th><th>剩余 / Remaining</th><th>重置 / Reset</th><th>说明 / Details</th></tr></thead><tbody>
-{{range .Buckets}}<tr><td>{{.Window}}</td><td>{{.Remaining}}</td><td>{{.Reset}}</td><td>{{.Description}}</td></tr>{{end}}
-</tbody></table>{{end}}
+<div class="table-scroll"><table><thead><tr><th>窗口 / Window</th><th>剩余 / Remaining</th><th>重置 / Reset</th><th>距重置 / Until reset</th><th>说明 / Details</th></tr></thead><tbody>
+{{range .Buckets}}<tr><td>{{.Window}}</td><td>{{.Remaining}}</td><td>{{if .ResetAt}}<time datetime="{{.ResetAt}}">{{.Reset}}</time>{{else}}{{.Reset}}{{end}}</td><td class="reset-countdown" data-countdown>—</td><td>{{.Description}}</td></tr>{{end}}
+</tbody></table></div>{{end}}
 </section>{{end}}
 <p class="read-at">限额读取自 GET /v1/limits；此页面不显示任何凭据。 / Limits are read from GET /v1/limits; this page never shows a credential.</p>
+<script nonce="{{.ScriptNonce}}">
+(() => {
+  const resets = Array.from(document.querySelectorAll('time[datetime]'), time => ({
+    time,
+    at: Date.parse(time.dateTime),
+    countdown: time.closest('tr').querySelector('[data-countdown]')
+  })).filter(entry => Number.isFinite(entry.at) && entry.countdown);
+  if (resets.length === 0) return;
+
+  const twoDigits = value => String(value).padStart(2, '0');
+  function update() {
+    const now = Date.now();
+    // Recreate the formatter so a changed browser time zone is reflected too.
+    const localTime = new Intl.DateTimeFormat(undefined, {
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hourCycle: 'h23', timeZoneName: 'short'
+    });
+    for (const entry of resets) {
+      entry.time.textContent = localTime.format(new Date(entry.at));
+      const seconds = Math.max(0, Math.ceil((entry.at - now) / 1000));
+      if (seconds === 0) {
+        entry.countdown.textContent = '已到时间 / Due';
+        continue;
+      }
+      const days = Math.floor(seconds / 86400);
+      const hours = Math.floor((seconds % 86400) / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const remainder = seconds % 60;
+      entry.countdown.textContent = (days ? days + 'd ' : '') +
+        twoDigits(hours) + ':' + twoDigits(minutes) + ':' + twoDigits(remainder);
+    }
+  }
+  update();
+  setInterval(update, 1000);
+})();
+</script>
 </body></html>`))

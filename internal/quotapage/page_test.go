@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -169,7 +170,8 @@ func TestPageRendersAccountAndModelGroupsWithoutCredentials(t *testing.T) {
 		"账户 1", "Account 1",
 		"pro", "paid",
 		"Account limits", "Model limits",
-		"5h", "42.5%", "2026-09-20 08:00 UTC", "57.5% used",
+		"5h", "42.5%", "2026-09-20 08:00 UTC", "datetime=\"2026-09-20T08:00:00Z\"", "57.5% used",
+		"距重置 / Until reset", "data-countdown", "new Intl.DateTimeFormat", "Date.now()",
 		"gpt-5.6-sol", "0.0%",
 	} {
 		if !strings.Contains(body, want) {
@@ -192,6 +194,15 @@ func TestPageRendersAccountAndModelGroupsWithoutCredentials(t *testing.T) {
 	if policy := resp.Headers.Get("Content-Security-Policy"); !strings.Contains(policy, "frame-ancestors 'self'") {
 		t.Fatalf("CSP does not allow the panel iframe: %q", policy)
 	}
+	// The page needs a script for browser-local time and a live countdown;
+	// allow only this script, using the per-response nonce in the CSP.
+	scriptNonce := regexp.MustCompile(`<script nonce="([A-Za-z0-9]+)">`).FindStringSubmatch(body)
+	if len(scriptNonce) != 2 {
+		t.Fatalf("page has no nonced script:\n%s", body)
+	}
+	if policy := resp.Headers.Get("Content-Security-Policy"); !strings.Contains(policy, "script-src 'nonce-"+scriptNonce[1]+"'") || strings.Contains(policy, "script-src 'unsafe-inline'") {
+		t.Fatalf("CSP does not allow exactly the page script: %q", policy)
+	}
 	if cache := resp.Headers.Get("Cache-Control"); cache != "no-store" {
 		t.Fatalf("cache control = %q", cache)
 	}
@@ -208,6 +219,36 @@ func TestPageRendersAccountAndModelGroupsWithoutCredentials(t *testing.T) {
 	}
 	if request.HTTPClient == nil {
 		t.Fatal("fetch request did not carry the host HTTP client")
+	}
+}
+
+func TestPageLeavesMissingOrInvalidResetWithoutCountdown(t *testing.T) {
+	fetcher := &fakeFetcher{responses: map[string]pluginapi.QuotaFetchResponse{
+		"a1": {Groups: []pluginapi.QuotaGroup{{DisplayName: "Account limits", Buckets: []pluginapi.QuotaBucket{
+			{Window: "offset", ResetTime: "2026-09-20T16:00:00.123456789+08:00"},
+			{Window: "missing"},
+			{Window: "invalid", ResetTime: "unknown"},
+		}}}},
+	}}
+	host := &fakeHost{
+		entries: []pluginapi.HostAuthFileEntry{{AuthIndex: "a1", Provider: "mirasim"}},
+		auths:   map[string]pluginapi.HostAuthGetResponse{"a1": {AuthIndex: "a1", JSON: []byte(`{"type":"mirasim"}`)}},
+		client:  fakeHTTPClient{},
+	}
+	page := New(fetcher)
+	resp := mustServe(t, page, quotaRequest(page), host)
+	body := string(resp.Body)
+	if !strings.Contains(body, `datetime="2026-09-20T08:00:00.123Z"`) {
+		t.Fatalf("offset reset was not normalized to one instant:\n%s", body)
+	}
+	if count := strings.Count(body, `<time datetime=`); count != 1 {
+		t.Fatalf("time element count = %d, want only the valid reset:\n%s", count, body)
+	}
+	if !strings.Contains(body, `<td>missing</td><td>0.0%</td><td>—</td><td class="reset-countdown" data-countdown>—</td>`) {
+		t.Fatalf("missing reset did not stay unavailable:\n%s", body)
+	}
+	if !strings.Contains(body, `<td>invalid</td><td>0.0%</td><td>unknown</td><td class="reset-countdown" data-countdown>—</td>`) {
+		t.Fatalf("invalid reset did not stay unavailable:\n%s", body)
 	}
 }
 
