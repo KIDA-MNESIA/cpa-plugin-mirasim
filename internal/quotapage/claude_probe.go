@@ -16,12 +16,12 @@ const (
 	claudeProbeBillingText = "x-anthropic-billing-header: cc_version=" + claudeProbeVersion + ".61d; cc_entrypoint=sdk-cli;"
 )
 
-// applyClaudeProbeProfile supplies the client envelope missing from a bare
-// Messages request. The baseline was captured from Claude Code 2.1.292 using
-// a local mock endpoint, --tools "", and the fixed probe prompt. Its custom
-// gateway leg omits OAuth betas and cch; the relay supplies its own auth/signing.
-// The billing suffix 61d fingerprints probePrompt with this client version.
-// Keep this profile local to quota probes; callers own their request identity.
+// applyClaudeProbeProfile gives a bare Messages request the bounded workload a
+// Claude Code availability check sends: the fixed probe prompt, its billing and
+// identity system blocks, an isolated session, and no client envelope. The
+// relay states its own client identity on the wire; a second product's headers
+// are refused there and are not this plugin's to borrow. The billing suffix 61d
+// fingerprints probePrompt with this client version.
 func applyClaudeProbeProfile(request *pluginapi.ExecutorRequest, body map[string]any) {
 	var device [32]byte
 	var session [16]byte
@@ -37,19 +37,8 @@ func applyClaudeProbeProfile(request *pluginapi.ExecutorRequest, body map[string
 	request.Metadata = map[string]any{"execution_session_id": sessionID}
 	request.Query = url.Values{"beta": {"true"}}
 	for name, value := range map[string]string{
-		"User-Agent":               "claude-cli/" + claudeProbeVersion + " (external, sdk-cli)",
-		"X-App":                    "cli",
 		"X-Claude-Code-Session-Id": sessionID,
 		"Anthropic-Version":        "2023-06-01",
-		"Anthropic-Beta":           "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219",
-		"Anthropic-Dangerous-Direct-Browser-Access": "true",
-		"X-Stainless-Lang":                          "js",
-		"X-Stainless-Package-Version":               "0.128.0",
-		"X-Stainless-Retry-Count":                   "0",
-		"X-Stainless-Runtime":                       "node",
-		"X-Stainless-Runtime-Version":               "v26.3.0",
-		"X-Stainless-OS":                            "MacOS",
-		"X-Stainless-Arch":                          "arm64",
 	} {
 		request.Headers.Set(name, value)
 	}

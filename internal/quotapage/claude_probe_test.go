@@ -14,12 +14,15 @@ import (
 
 var probeSessionPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
-// Validate the relay-visible contract against the independently captured
-// Claude Code helper envelope, including its bounded availability workload.
+// Validate the relay-visible contract for a Claude Code availability probe:
+// the bounded workload, its own session identity, and no client envelope of a
+// second product. The client identity on the wire is the Mirasim client, which
+// mirasim.Client.prepareHeaders states for every relay call.
 func validateClaudeProbe(request pluginapi.HTTPRequest) error {
-	if request.Headers.Get("X-App") != "cli" || request.Headers.Get("User-Agent") != "claude-cli/2.1.292 (external, sdk-cli)" ||
-		!strings.Contains(request.Headers.Get("Anthropic-Beta"), "claude-code-20250219") {
-		return fmt.Errorf("missing Claude Code client headers")
+	for _, name := range []string{"X-App", "Anthropic-Beta", "X-Stainless-Lang"} {
+		if got := request.Headers.Get(name); got != "" {
+			return fmt.Errorf("probe sent %s: %q", name, got)
+		}
 	}
 	var body struct {
 		System []struct {
@@ -60,7 +63,7 @@ func validateClaudeProbe(request pluginapi.HTTPRequest) error {
 	return nil
 }
 
-func TestClaudeProbeCarriesAnIsolatedClientEnvelope(t *testing.T) {
+func TestClaudeProbeCarriesAnIsolatedSession(t *testing.T) {
 	first := minimalProbeRequest("claude-haiku-4-5", "chat")
 	second := minimalProbeRequest("claude-opus-5-5", "chat")
 	for _, request := range []pluginapi.ExecutorRequest{first, second} {

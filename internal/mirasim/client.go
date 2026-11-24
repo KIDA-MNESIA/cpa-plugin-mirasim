@@ -326,7 +326,7 @@ func (c *Client) do(ctx context.Context, client pluginapi.HostHTTPClient, method
 			return pluginapi.HTTPResponse{}, errAuth
 		}
 		forceTicket = false
-		outboundHeaders := prepareHeaders(headers, authHeaders, false)
+		outboundHeaders := c.prepareHeaders(headers, authHeaders, false)
 		for key, values := range providerHeaders {
 			outboundHeaders[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
 		}
@@ -380,7 +380,7 @@ func (c *Client) DoStream(ctx context.Context, client pluginapi.HostHTTPClient, 
 			return pluginapi.HTTPStreamResponse{}, errAuth
 		}
 		forceTicket = false
-		outboundHeaders := prepareHeaders(headers, authHeaders, true)
+		outboundHeaders := c.prepareHeaders(headers, authHeaders, true)
 		resp, errDo := client.DoStream(ctx, pluginapi.HTTPRequest{
 			Method:      method,
 			URL:         endpoint,
@@ -767,7 +767,7 @@ func (c *Client) observeQuota(headers http.Header) {
 	c.mu.Unlock()
 }
 
-func prepareHeaders(source, auth http.Header, stream bool) http.Header {
+func (c *Client) prepareHeaders(source, auth http.Header, stream bool) http.Header {
 	headers := cloneHeader(source)
 	for name := range headers {
 		// Codex marks a Responses Lite request with this header. The relay
@@ -787,6 +787,14 @@ func prepareHeaders(source, auth http.Header, stream bool) http.Header {
 	for key, values := range auth {
 		headers[key] = append([]string(nil), values...)
 	}
+	// The relay answers every unrecognized User-Agent on its Anthropic Messages
+	// route with 403 "this client is not supported; use the mirasim client or
+	// Claude Code", before a model is reached. State the client this is: the
+	// Mirasim client, whose version x-mirasim-client already carries. A caller's
+	// own User-Agent cannot be allowed through, because an arbitrary one is the
+	// refusal. Codex, DeepSeek, ZCode and Kimi are not gated, and naming the
+	// Mirasim client to them changes nothing they check.
+	headers.Set("User-Agent", "Mirasim/"+c.storage.ClientVersion)
 	if headers.Get("Content-Type") == "" {
 		headers.Set("Content-Type", "application/json")
 	}
