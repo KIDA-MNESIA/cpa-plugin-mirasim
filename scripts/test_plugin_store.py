@@ -94,7 +94,7 @@ class PluginStoreTests(unittest.TestCase):
             verify_release(self.root, "v0.7.1")
 
     def test_submission_has_no_pinned_version(self):
-        prepare_submission(self.root, "https://github.com/KIDA-MNESIA/cpa-plugin-mirasim", "KIDA-MNESIA", "v0.7.1")
+        prepare_submission(self.root, "https://github.com/yescomputer/cpa-plugin-mirasim", "yescomputer", "v0.7.1")
         registry = json.loads((self.root / "registry.json").read_text())
         self.assertEqual(registry["schema_version"], 1)
         self.assertEqual(registry["plugins"][0]["id"], "mirasim")

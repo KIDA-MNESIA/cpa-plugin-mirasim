@@ -52,8 +52,8 @@ func Build(configYAML []byte) pluginapi.Plugin {
 		Metadata: pluginapi.Metadata{
 			Name:             "Mirasim Provider",
 			Version:          "1.3.2",
-			Author:           "KIDA-MNESIA",
-			GitHubRepository: "https://github.com/KIDA-MNESIA/cpa-plugin-mirasim",
+			Author:           "yescomputer",
+			GitHubRepository: "https://github.com/yescomputer/cpa-plugin-mirasim",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "collect", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Set false to request Mirasim relay collection off."},
 				{Name: "locale", Type: pluginapi.ConfigFieldTypeString, Description: "Optional locale sent in encrypted Mirasim metadata."},

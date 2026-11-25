@@ -21,7 +21,7 @@ plugins:
   dir: plugins
 ```
 
-也可以从 [Releases](https://github.com/KIDA-MNESIA/cpa-plugin-mirasim/releases) 下载对应系统的压缩包。包内是单个 `mirasim.so`（Linux、FreeBSD）、`mirasim.dylib`（macOS）或 `mirasim.dll`（Windows）。放到 CPA 的 `plugins` 目录后写入：
+也可以从 [Releases](https://github.com/yescomputer/cpa-plugin-mirasim/releases) 下载对应系统的压缩包。包内是单个 `mirasim.so`（Linux、FreeBSD）、`mirasim.dylib`（macOS）或 `mirasim.dll`（Windows）。放到 CPA 的 `plugins` 目录后写入：
 
 ```yaml
 plugins:
