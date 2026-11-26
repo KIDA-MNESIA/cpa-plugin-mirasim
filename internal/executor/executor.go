@@ -299,10 +299,18 @@ func buildProviderRequest(req pluginapi.ExecutorRequest, stream bool, shape thin
 		body = thinkingpkg.NormalizeForWire(body, model, wire.String(), shape)
 	}
 	path := "/v1/responses"
+	query := cloneValues(req.Query)
 	if wire == sdktranslator.FormatClaude {
+		// The relay serves Claude Code traffic on the beta Messages route only.
 		path = "/v1/messages"
+		if query == nil {
+			query = url.Values{}
+		}
+		if query.Get("beta") == "" {
+			query.Set("beta", "true")
+		}
 	}
-	return body, providerRoute{Format: wire, Path: path, Query: cloneValues(req.Query)}, nil
+	return body, providerRoute{Format: wire, Path: path, Query: query}, nil
 }
 
 func selectWireFormat(model string, source sdktranslator.Format) sdktranslator.Format {
@@ -528,6 +536,7 @@ func normalizeBody(body []byte, model string, stream bool, wire sdktranslator.Fo
 	}
 	payload["model"] = normalizeModel(model)
 	if wire == sdktranslator.FormatClaude {
+		payload["system"] = withAgentIdentity(payload["system"])
 		payload["stream"] = stream
 	} else {
 		// The Codex wire protocol returns SSE even when the downstream request is
@@ -629,4 +638,44 @@ func cloneValues(source url.Values) url.Values {
 		clone[key] = append([]string(nil), values...)
 	}
 	return clone
+}
+
+// claudeAgentIdentity is the first system block the relay requires on every
+// Anthropic Messages request; a request without it is rejected as bad_request.
+const claudeAgentIdentity = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+
+// withAgentIdentity prepends claudeAgentIdentity to a system value that does not
+// already lead with it, in the string, block-array, or empty shapes a caller sends.
+func withAgentIdentity(system any) any {
+	block := func() []any {
+		return []any{map[string]any{"type": "text", "text": claudeAgentIdentity}}
+	}
+	switch value := system.(type) {
+	case nil:
+		return block()
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return block()
+		}
+		// The relay reads system as text blocks; a bare string that already leads
+		// with the identity becomes a one-block array, not a string.
+		text := value
+		if strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), claudeAgentIdentity) {
+			return []any{map[string]any{"type": "text", "text": text}}
+		}
+		return append(block(), map[string]any{"type": "text", "text": value})
+	case []any:
+		for _, item := range value {
+			entry, ok := item.(map[string]any)
+			if !ok || entry["type"] != "text" {
+				continue
+			}
+			if text, ok := entry["text"].(string); ok && strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), claudeAgentIdentity) {
+				return value
+			}
+		}
+		return append(block(), value...)
+	default:
+		return block()
+	}
 }

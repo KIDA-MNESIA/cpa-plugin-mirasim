@@ -44,7 +44,6 @@ var relayHeaderProfile = []string{
 	headerMirasimCall,
 	quotaProbeHeader,
 	"accept-encoding",
-	"user-agent",
 }
 
 // wireProfile returns the outbound profile for relay calls, or nil to leave the
